@@ -1,5 +1,5 @@
 use crate::timber_cli::{
-    self, Inventory, MutationCommand, MutationOutcome, WorktreeRecord, display_text,
+    self, FileStatus, Inventory, MutationCommand, MutationOutcome, WorktreeRecord, display_text,
 };
 use crate::timber_operations::{Operation, OperationPhase, OperationRequest, TimberOperations};
 use anyhow::{Context as _, Result};
@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use ui::ActiveTheme as _;
-use ui::{Button, prelude::*};
+use ui::{ButtonLike, Tooltip, prelude::*};
 use util::ResultExt as _;
 use util::path_list::PathList;
 use workspace::{
@@ -65,6 +65,8 @@ pub struct TimberSidebar {
     handled_operations: HashSet<u64>,
     input: Option<Entity<Editor>>,
     form_open: bool,
+    show_paths: bool,
+    expanded_operations: HashSet<u64>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -127,7 +129,7 @@ impl TimberSidebar {
         Self {
             multi_workspace: multi_workspace.downgrade(),
             focus_handle: cx.focus_handle(),
-            width: px(240.),
+            width: px(262.),
             cwd: None,
             inventory: None,
             selected_common_git_dir: None,
@@ -155,6 +157,8 @@ impl TimberSidebar {
             handled_operations: HashSet::new(),
             input: None,
             form_open: false,
+            show_paths: false,
+            expanded_operations: HashSet::new(),
             _subscriptions: vec![subscription],
         }
     }
@@ -359,128 +363,272 @@ impl TimberSidebar {
             .collect::<Vec<_>>();
         div()
             .id("timber-operations")
-            .max_h(px(240.))
-            .overflow_y_scroll()
+            .max_h(px(200.))
             .flex()
             .flex_col()
-            .gap_2()
-            .px_3()
-            .py_2()
-            .child(div().text_xs().child("OPERATIONS"))
-            .when(operations.is_empty(), |this| {
-                this.child(div().text_xs().child("No operations yet."))
-            })
-            .children(operations.into_iter().map(|operation| {
-                let id = operation.id;
-                let target_available = self.operation_target(&operation).is_ok();
-                let failed = operation
-                    .result
-                    .as_ref()
-                    .is_some_and(|result| result.outcome == MutationOutcome::Failed);
-                let label = format!(
-                    "#{} {} {}",
-                    id,
-                    operation.request.command.name(),
-                    display_text(&operation.request.input)
-                );
-                let result_operation = operation.clone();
-                let recovery_operation = operation.clone();
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(div().text_xs().child(label))
-                    .child(div().text_xs().child(operation.status()))
-                    .when_some(operation.error.clone(), |this, error| {
-                        this.child(div().text_xs().child(display_text(&error)))
+            .flex_none()
+            .border_t_1()
+            .border_color(cx.theme().colors().border)
+            .child(
+                h_flex().h(px(34.)).flex_none().px_3().child(
+                    Label::new("OPERATIONS")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                ),
+            )
+            .child(
+                v_flex()
+                    .id("timber-operations-list")
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px_1()
+                    .pb_2()
+                    .when(operations.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .px_2()
+                                .text_xs()
+                                .text_color(cx.theme().colors().text_muted)
+                                .child("No operations yet."),
+                        )
                     })
-                    .child(
+                    .children(operations.into_iter().map(|operation| {
+                        let id = operation.id;
+                        let target_available = self.operation_target(&operation).is_ok();
+                        let failed = operation
+                            .result
+                            .as_ref()
+                            .is_some_and(|result| result.outcome == MutationOutcome::Failed);
+                        let label = format!(
+                            "timber {} {}",
+                            operation.request.command.name(),
+                            display_text(&operation.request.input)
+                        );
+                        let expanded = self.expanded_operations.contains(&id);
+                        let (state, color, icon) = match operation.phase {
+                            OperationPhase::Running => {
+                                ("Running", Color::Accent, IconName::ArrowCircle)
+                            }
+                            OperationPhase::Reconciling => {
+                                ("Refreshing", Color::Accent, IconName::RefreshTitle)
+                            }
+                            OperationPhase::NeedsRefresh => {
+                                ("Refresh needed", Color::Warning, IconName::Warning)
+                            }
+                            OperationPhase::Finished if operation.status() == "Completed" => {
+                                ("Completed", Color::Success, IconName::Check)
+                            }
+                            OperationPhase::Finished if operation.status() == "Cancelled" => {
+                                ("Cancelled", Color::Muted, IconName::Dash)
+                            }
+                            OperationPhase::Finished => ("Failed", Color::Error, IconName::Warning),
+                        };
+                        let result_operation = operation.clone();
+                        let recovery_operation = operation.clone();
                         div()
                             .flex()
-                            .flex_wrap()
+                            .flex_col()
                             .gap_1()
                             .child(
-                                Button::new(("timber-output", id), "Output")
-                                    .disabled(operation.view.is_none())
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        let result =
-                                            this.operations.update(cx, |operations, cx| {
-                                                operations.output(id, window, cx)
-                                            });
-                                        if let Err(error) = result {
-                                            this.error = Some(format!("{error:#}").into());
-                                            cx.notify();
+                                ButtonLike::new(("timber-operation", id))
+                                    .full_width()
+                                    .auto_height()
+                                    .tab_index(0_isize)
+                                    .aria_label(format!("{label}: {}", operation.status()))
+                                    .aria_expanded(expanded)
+                                    .tooltip({
+                                        let label = label.clone();
+                                        let status = operation.status();
+                                        move |_, cx| {
+                                            Tooltip::simple(format!("{label}: {status}"), cx)
                                         }
-                                    })),
-                            )
-                            .when(operation.phase == OperationPhase::NeedsRefresh, |this| {
-                                this.child(
-                                    Button::new(("timber-reconcile", id), "Refresh").on_click(
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.operations.update(cx, |operations, cx| {
-                                                operations.reconcile(id, cx)
-                                            });
-                                        }),
-                                    ),
-                                )
-                            })
-                            .when(target_available, |this| {
-                                this.child(
-                                    Button::new(
-                                        ("timber-open-result", id),
-                                        if failed {
-                                            "Open Existing"
-                                        } else {
-                                            "Open Result"
-                                        },
-                                    )
-                                    .on_click(cx.listener(
-                                        move |this, _, window, cx| {
-                                            this.open_operation_result(
-                                                &result_operation,
-                                                window,
-                                                cx,
-                                            );
-                                        },
-                                    )),
-                                )
-                            })
-                            .when(failed && target_available, |this| {
-                                this.child(
-                                    Button::new(("timber-retry-setup", id), "Retry Setup")
-                                        .disabled(
-                                            self.selected_common_git_dir.as_ref().is_some_and(
-                                                |repository| {
-                                                    self.operations.read(cx).busy(repository)
-                                                },
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if !this.expanded_operations.remove(&id) {
+                                            this.expanded_operations.insert(id);
+                                        }
+                                        cx.notify();
+                                    }))
+                                    .child(
+                                        h_flex()
+                                            .w_full()
+                                            .min_w_0()
+                                            .gap_1()
+                                            .py_1()
+                                            .child(
+                                                Icon::new(if expanded {
+                                                    IconName::ChevronDown
+                                                } else {
+                                                    IconName::ChevronRight
+                                                })
+                                                .size(IconSize::XSmall)
+                                                .color(Color::Muted),
+                                            )
+                                            .child(
+                                                Icon::new(icon).size(IconSize::XSmall).color(color),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .text_left()
+                                                    .text_xs()
+                                                    .font_buffer(cx)
+                                                    .truncate()
+                                                    .child(label),
+                                            )
+                                            .child(
+                                                Label::new(state)
+                                                    .size(LabelSize::XSmall)
+                                                    .color(color),
                                             ),
+                                    ),
+                            )
+                            .when(expanded, |this| {
+                                this.child(
+                                    v_flex()
+                                        .px_2()
+                                        .pb_1()
+                                        .gap_1()
+                                        .child(
+                                            Label::new(operation.status())
+                                                .size(LabelSize::XSmall)
+                                                .color(color),
                                         )
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            let result = this
-                                                .operation_target(&recovery_operation)
-                                                .and_then(|tree| {
-                                                    tree.path
+                                        .when_some(operation.error.clone(), |this, error| {
+                                            this.child(div().text_xs().child(display_text(&error)))
+                                        })
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_wrap()
+                                                .gap_1()
+                                                .child(
+                                                    Button::new(("timber-output", id), "Output")
+                                                        .size(ButtonSize::Compact)
+                                                        .tab_index(0_isize)
+                                                        .disabled(operation.view.is_none())
+                                                        .on_click(cx.listener(
+                                                            move |this, _, window, cx| {
+                                                                let result =
+                                                                    this.operations.update(
+                                                                        cx,
+                                                                        |operations, cx| {
+                                                                            operations.output(
+                                                                                id, window, cx,
+                                                                            )
+                                                                        },
+                                                                    );
+                                                                if let Err(error) = result {
+                                                                    this.error = Some(
+                                                                        format!("{error:#}").into(),
+                                                                    );
+                                                                    cx.notify();
+                                                                }
+                                                            },
+                                                        )),
+                                                )
+                                                .when(
+                                                    operation.phase == OperationPhase::NeedsRefresh,
+                                                    |this| {
+                                                        this.child(
+                                                            Button::new(
+                                                                ("timber-reconcile", id),
+                                                                "Refresh",
+                                                            )
+                                                            .size(ButtonSize::Compact)
+                                                            .tab_index(0_isize)
+                                                            .on_click(cx.listener(
+                                                                move |this, _, _, cx| {
+                                                                    this.operations.update(
+                                                                        cx,
+                                                                        |operations, cx| {
+                                                                            operations
+                                                                                .reconcile(id, cx)
+                                                                        },
+                                                                    );
+                                                                },
+                                                            )),
+                                                        )
+                                                    },
+                                                )
+                                                .when(target_available, |this| {
+                                                    this.child(
+                                                        Button::new(
+                                                            ("timber-open-result", id),
+                                                            if failed {
+                                                                "Open Existing"
+                                                            } else {
+                                                                "Open Result"
+                                                            },
+                                                        )
+                                                        .size(ButtonSize::Compact)
+                                                        .tab_index(0_isize)
+                                                        .on_click(cx.listener(
+                                                            move |this, _, window, cx| {
+                                                                this.open_operation_result(
+                                                                    &result_operation,
+                                                                    window,
+                                                                    cx,
+                                                                );
+                                                            },
+                                                        )),
+                                                    )
+                                                })
+                                                .when(failed && target_available, |this| {
+                                                    this.child(
+                                                        Button::new(
+                                                            ("timber-retry-setup", id),
+                                                            "Retry Setup",
+                                                        )
+                                                        .size(ButtonSize::Compact)
+                                                        .tab_index(0_isize)
+                                                        .disabled(
+                                                            self.selected_common_git_dir
+                                                                .as_ref()
+                                                                .is_some_and(|repository| {
+                                                                    self.operations
+                                                                        .read(cx)
+                                                                        .busy(repository)
+                                                                }),
+                                                        )
+                                                        .on_click(cx.listener(
+                                                            move |this, _, window, cx| {
+                                                                let result = this
+                                                                    .operation_target(
+                                                                        &recovery_operation,
+                                                                    )
+                                                                    .and_then(|tree| {
+                                                                        tree.path
                                                         .to_str()
                                                         .map(ToOwned::to_owned)
                                                         .context("Worktree path is not UTF-8")
-                                                });
-                                            match result {
-                                                Ok(path) => this.start_operation(
-                                                    MutationCommand::RetrySetup,
-                                                    path,
-                                                    window,
-                                                    cx,
-                                                ),
-                                                Err(error) => {
-                                                    this.error = Some(format!("{error:#}").into());
-                                                    cx.notify();
-                                                }
-                                            }
-                                        })),
+                                                                    });
+                                                                match result {
+                                                                    Ok(path) => this
+                                                                        .start_operation(
+                                                                        MutationCommand::RetrySetup,
+                                                                        path,
+                                                                        window,
+                                                                        cx,
+                                                                    ),
+                                                                    Err(error) => {
+                                                                        this.error = Some(
+                                                                            format!("{error:#}")
+                                                                                .into(),
+                                                                        );
+                                                                        cx.notify();
+                                                                    }
+                                                                }
+                                                            },
+                                                        )),
+                                                    )
+                                                }),
+                                        ),
                                 )
-                            }),
-                    )
-            }))
+                            })
+                    })),
+            )
     }
 
     fn listen_for_terminal_handoffs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1257,7 +1405,7 @@ impl Focusable for TimberSidebar {
 }
 
 impl Render for TimberSidebar {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.forget_changed_workspaces(cx);
         let active_workspace = self
             .multi_workspace
@@ -1270,51 +1418,58 @@ impl Render for TimberSidebar {
             .as_ref()
             .map(|inventory| inventory.worktrees.clone())
             .unwrap_or_default();
+        let repository = self
+            .inventory
+            .as_ref()
+            .map(|inventory| inventory.repository.primary_worktree_root.clone());
         let retained_rows = self.recovery_rows();
         let busy = self
             .selected_common_git_dir
             .as_ref()
             .is_some_and(|repository| self.operations.read(cx).busy(repository));
         let operations = self.render_operations(cx);
-        div()
+        v_flex()
             .track_focus(&self.focus_handle)
-            .flex()
-            .flex_col()
             .size_full()
+            .min_w_0()
             .bg(cx.theme().colors().surface_background)
-            .child(
-                div()
-                    .h(px(34.))
-                    .px_3()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .text_xs()
-                    .child("WORKTREES")
-                    .child(Button::new("timber-new", "New")
+            .child(h_flex().h(px(34.)).flex_none().pl_3().pr_2().justify_between()
+                .child(div().flex_1().min_w_0().text_xs().text_color(cx.theme().colors().text_muted).truncate().child("WORKTREES"))
+                .child(h_flex().flex_none().gap_1()
+                    .child(IconButton::new("timber-paths", IconName::Eye)
+                        .icon_size(IconSize::Small).tab_index(0_isize)
+                        .aria_label("Show full worktree paths").toggle_state(self.show_paths)
+                        .tooltip(Tooltip::text(if self.show_paths { "Hide full worktree paths" } else { "Show full worktree paths" }))
+                        .on_click(cx.listener(|this, _, _, cx| { this.show_paths = !this.show_paths; cx.notify(); })))
+                    .child(IconButton::new("timber-refresh", IconName::RefreshTitle)
+                        .icon_size(IconSize::Small).tab_index(0_isize)
+                        .aria_label("Refresh worktrees")
+                        .tooltip(Tooltip::text(if self.loading { "Refreshing worktrees…" } else { "Refresh worktrees" }))
+                        .icon_color(if self.loading { Color::Accent } else { Color::Muted })
+                        .disabled(self.cwd.is_none() || self.loading)
+                        .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))))
+                    .child(Button::new("timber-new", "New").size(ButtonSize::Compact)
+                        .style(ButtonStyle::Filled).tab_index(0_isize)
+                        .start_icon(Icon::new(IconName::Plus).size(IconSize::XSmall))
+                        .aria_label("New worktree").aria_expanded(self.form_open)
+                        .tooltip(Tooltip::text("Create or open a worktree"))
                         .disabled(self.inventory.is_none())
-                        .on_click(cx.listener(|this, _, window, cx| this.toggle_form(window, cx))))
-                    .child(
-                        Button::new(
-                            "timber-refresh",
-                            if self.loading {
-                                "Refreshing…"
-                            } else {
-                                "Refresh"
-                            },
-                        )
-                        .disabled(self.cwd.is_none())
-                        .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
-                    ),
-            )
-            .when_some(self.cwd.clone(), |this, cwd| {
-                this.child(div().px_3().py_1().text_xs().child(format!(
-                    "Repository from {}",
-                    display_text(&cwd.display().to_string())
-                )))
+                        .on_click(cx.listener(|this, _, window, cx| this.toggle_form(window, cx))))))
+            .when_some(repository, |this, repository| {
+                let path = display_text(&repository.display().to_string());
+                let name = display_text(&repository.file_name().map(|name| name.to_string_lossy()).unwrap_or_else(|| repository.to_string_lossy()));
+                this.child(h_flex().flex_none().mx_2().mb_1().px_2().py_1p5().gap_2().min_w_0()
+                    .rounded_md().border_1().border_color(cx.theme().colors().border)
+                    .bg(cx.theme().colors().element_background)
+                    .child(Icon::new(IconName::Folder).size(IconSize::Small).color(Color::Muted))
+                    .child(div().id("timber-repository").flex_1().min_w_0().text_sm().font_weight(gpui::FontWeight::SEMIBOLD).truncate().child(name)
+                        .tooltip(move |_, cx| Tooltip::simple(path.clone(), cx)))
+                    .child(Label::new(rows.len().to_string()).size(LabelSize::Small).color(Color::Muted)))
             })
             .when(self.form_open, |this| {
-                this.child(div().px_3().py_2().flex().flex_col().gap_2()
+                this.child(v_flex().flex_none().mx_2().mb_2().p_2().gap_1p5().rounded_lg()
+                    .border_1().border_color(cx.theme().colors().border)
+                    .bg(cx.theme().colors().element_background)
                     .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
                         match event.keystroke.key.as_str() {
                             "escape" => { this.toggle_form(window, cx); cx.stop_propagation(); }
@@ -1324,92 +1479,81 @@ impl Render for TimberSidebar {
                             _ => {}
                         }
                     }))
-                    .child(div().text_xs().child("Ticket or branch name"))
-                    .when_some(self.input.clone(), |this, input| this.child(input))
-                    .child(div().text_xs().child("Timber resolves the ticket, runs setup, and opens your configured agent in the worktree."))
-                    .child(div().flex().flex_wrap().gap_1()
-                        .child(Button::new("timber-create", "Create").disabled(busy)
-                            .on_click(cx.listener(|this, _, window, cx| this.submit_operation(MutationCommand::New, window, cx))))
-                        .child(Button::new("timber-open", "Open").disabled(busy)
+                    .child(Label::new("Ticket or branch name").size(LabelSize::Small).color(Color::Muted))
+                    .when_some(self.input.clone(), |this, input| this.child(
+                        div().px_2().py_1p5().rounded_md().border_1()
+                            .border_color(if input.focus_handle(cx).contains_focused(window, cx) { cx.theme().colors().border_focused } else { cx.theme().colors().border })
+                            .bg(cx.theme().colors().editor_background).child(input)))
+                    .child(div().text_xs().text_color(cx.theme().colors().text_muted)
+                        .child("Timber resolves the ticket, runs setup, and opens your configured agent."))
+                    .child(h_flex().flex_wrap().justify_end().gap_1()
+                        .child(Button::new("timber-cancel", "Cancel").size(ButtonSize::Compact).tab_index(0_isize)
+                            .on_click(cx.listener(|this, _, window, cx| this.toggle_form(window, cx))))
+                        .child(Button::new("timber-open", "Open").size(ButtonSize::Compact).style(ButtonStyle::Filled).tab_index(0_isize).disabled(busy)
                             .on_click(cx.listener(|this, _, window, cx| this.submit_operation(MutationCommand::Open, window, cx))))
-                        .child(Button::new("timber-cancel", "Cancel")
-                            .on_click(cx.listener(|this, _, window, cx| this.toggle_form(window, cx)))))
-                    .when(busy, |this| this.child(div().text_xs().child("An operation is running for this repository. See Operations for output."))))
+                        .child(Button::new("timber-create", "Create").size(ButtonSize::Compact).style(ButtonStyle::Tinted(ui::TintColor::Accent)).tab_index(0_isize).disabled(busy)
+                            .on_click(cx.listener(|this, _, window, cx| this.submit_operation(MutationCommand::New, window, cx)))))
+                    .when(busy, |this| this.child(div().text_xs().text_color(cx.theme().colors().text_accent).child("Operation running. See Operations for output."))))
             })
             .when_some(self.error.clone(), |this, error| {
-                this.child(div().px_3().py_2().text_sm().child(error))
+                this.child(div().px_3().py_2().text_xs().text_color(cx.theme().status().error).child(error))
             })
             .when(self.cwd.is_none(), |this| {
-                this.child(
-                    div()
-                        .px_3()
-                        .py_2()
-                        .text_sm()
-                        .child("Open a local repository to list worktrees."),
-                )
+                this.child(div().px_3().py_2().text_sm().text_color(cx.theme().colors().text_muted).child("Open a local repository to list worktrees."))
             })
-            .child(
-                div()
-                    .id("timber-worktree-list")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .children(rows.into_iter().enumerate().map(|(index, tree)| {
-                        let label: SharedString =
-                            display_text(tree.branch.as_deref().unwrap_or("Detached HEAD")).into();
-                        let path = display_text(&tree.path.display().to_string());
-                        let summary = tree.summary();
-                        let selected = self.retained.iter().any(|(id, retained)| {
-                            Some(*id) == active_workspace
-                                && retained.tree.canonical_path.is_some()
-                                && retained.tree.canonical_path == tree.canonical_path
-                        });
-                        div()
-                            .px_3()
-                            .py_2()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                Button::new(("timber-worktree", index), label)
-                                    .aria_label(path.clone())
-                                    .full_width()
-                                    .tab_index(0_isize)
-                                    .toggle_state(selected)
-                                    .selected_style(ui::ButtonStyle::Tinted(ui::TintColor::Accent))
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.activate_worktree(tree.clone(), None, window, cx)
-                                    })),
-                            )
-                            .child(div().text_xs().child(summary))
-                            .child(div().text_xs().child(path))
-                    }))
-                    .children(retained_rows.into_iter().map(|(id, workspace, path)| {
-                        div()
-                            .px_3()
-                            .py_2()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                Button::new(
-                                    ("timber-retained", id),
-                                    "Retained editor (unavailable)",
-                                )
-                                .toggle_state(Some(id) == active_workspace)
-                                .on_click(cx.listener(
-                                    move |this, _, window, cx| {
-                                        this.activate_retained(workspace.clone(), window, cx)
-                                    },
-                                )),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .child(display_text(&path.display().to_string())),
-                            )
-                    })),
-            )
+            .child(v_flex().id("timber-worktree-list").flex_1().min_h_0().min_w_0().px_1p5().overflow_y_scroll()
+                .children(rows.into_iter().enumerate().map(|(index, tree)| {
+                    let branch = display_text(tree.branch.as_deref().unwrap_or("Detached HEAD"));
+                    let label = display_text(&tree.path.file_name().map(|name| name.to_string_lossy()).unwrap_or_else(|| tree.path.to_string_lossy()));
+                    let path = display_text(&tree.path.display().to_string());
+                    let summary = tree.summary();
+                    let selected = self.retained.iter().any(|(id, retained)| {
+                        Some(*id) == active_workspace && retained.tree.canonical_path.is_some() && retained.tree.canonical_path == tree.canonical_path
+                    });
+                    let (status, color) = if !tree.path_exists {
+                        ("Missing".to_owned(), Color::Error)
+                    } else if tree.prunable.is_some() {
+                        ("Prunable".to_owned(), Color::Warning)
+                    } else if tree.locked.is_some() {
+                        ("Locked".to_owned(), Color::Warning)
+                    } else {
+                        match &tree.status {
+                            FileStatus::Known { modified, untracked, .. } if *modified != 0 || *untracked != 0 => (format!("{modified} modified · {untracked} untracked"), Color::Warning),
+                            FileStatus::Known { .. } => ("Clean".to_owned(), Color::Success),
+                            FileStatus::Unknown { .. } => ("Status unknown".to_owned(), Color::Muted),
+                        }
+                    };
+                    div().mb_0p5().child(ButtonLike::new(("timber-worktree", index))
+                        .aria_label(format!("{label}, {branch}, {summary}, {path}"))
+                        .full_width().auto_height().tab_index(0_isize)
+                        .toggle_state(selected).selected_style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                        .tooltip({ let path = path.clone(); move |_, cx| Tooltip::simple(format!("{path}\n{summary}"), cx) })
+                        .child(v_flex().w_full().min_w_0().py_1p5().pl_1().gap_0p5().text_left()
+                            .border_l_2().border_color(if selected { cx.theme().colors().text_accent } else { gpui::transparent_black() })
+                            .child(h_flex().min_w_0().gap_1p5()
+                                .child(div().flex_1().min_w_0().text_sm().font_weight(gpui::FontWeight::MEDIUM).truncate().child(label))
+                                .when(tree.is_primary, |this| this.child(div().px_1().rounded_sm().border_1().border_color(cx.theme().colors().border).child(Label::new("primary").size(LabelSize::XSmall).color(Color::Muted)))))
+                            .child(h_flex().min_w_0().gap_1()
+                                .child(Icon::new(IconName::GitBranch).size(IconSize::XSmall).color(Color::Muted))
+                                .child(div().flex_1().min_w_0().text_xs().font_buffer(cx).text_color(cx.theme().colors().text_muted).truncate().child(branch)))
+                            .child(h_flex().min_w_0().child(div().min_w_0().px_1().rounded_sm().bg(cx.theme().colors().element_background).text_xs().text_color(color.color(cx)).truncate().child(status)))
+                            .when(self.show_paths, |this| this.child(div().text_xs().font_buffer(cx).text_color(cx.theme().colors().text_muted).overflow_hidden().child(path))))
+                        .on_click(cx.listener(move |this, _, window, cx| this.activate_worktree(tree.clone(), None, window, cx))))
+                }))
+                .children(retained_rows.into_iter().map(|(id, workspace, path)| {
+                    let path = display_text(&path.display().to_string());
+                    div().py_1().child(ButtonLike::new(("timber-retained", id))
+                        .full_width().auto_height().tab_index(0_isize)
+                        .aria_label(format!("Retained editor, unavailable: {path}"))
+                        .toggle_state(Some(id) == active_workspace)
+                        .selected_style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                        .tooltip({ let path = path.clone(); move |_, cx| Tooltip::simple(path.clone(), cx) })
+                        .child(v_flex().w_full().min_w_0().py_1().text_left()
+                            .child(Label::new("Retained editor").size(LabelSize::Small))
+                            .child(Label::new("Unavailable").size(LabelSize::XSmall).color(Color::Warning))
+                            .when(self.show_paths, |this| this.child(div().text_xs().overflow_hidden().child(path))))
+                        .on_click(cx.listener(move |this, _, window, cx| this.activate_retained(workspace.clone(), window, cx))))
+                })))
             .child(operations)
     }
 }
@@ -1419,7 +1563,7 @@ impl WorkspaceSidebar for TimberSidebar {
         self.width
     }
     fn set_width(&mut self, width: Option<Pixels>, cx: &mut Context<Self>) {
-        self.width = width.unwrap_or(px(240.)).clamp(px(180.), px(500.));
+        self.width = width.unwrap_or(px(262.)).clamp(px(180.), px(500.));
         cx.notify();
     }
     fn has_notifications(&self, _cx: &App) -> bool {
