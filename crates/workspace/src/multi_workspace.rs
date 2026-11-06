@@ -6,8 +6,8 @@ use gpui::{
     ManagedView, MouseButton, Pixels, Render, Subscription, Task, TaskExt, WeakEntity, Window,
     WindowId, actions, deferred, px,
 };
+use project::Project;
 pub use project::ProjectGroupKey;
-use project::{DisableAiSettings, Project};
 use remote::RemoteConnectionOptions;
 use settings::Settings;
 pub use settings::SidebarSide;
@@ -347,18 +347,6 @@ impl MultiWorkspace {
                 task.detach();
             }
         });
-        let settings_subscription = cx.observe_global_in::<settings::SettingsStore>(window, {
-            let mut previous_multi_workspace_enabled = !DisableAiSettings::get_global(cx)
-                .disable_ai
-                && AgentSettings::get_global(cx).enabled;
-            move |this, window, cx| {
-                let multi_workspace_enabled = this.multi_workspace_enabled(cx);
-                if previous_multi_workspace_enabled && !multi_workspace_enabled {
-                    this.collapse_to_single_workspace(window, cx);
-                }
-                previous_multi_workspace_enabled = multi_workspace_enabled;
-            }
-        });
         Self::subscribe_to_workspace(&workspace, window, cx);
         let weak_self = cx.weak_entity();
         let active_workspace_id = Rc::new(Cell::new(workspace.entity_id()));
@@ -379,7 +367,7 @@ impl MultiWorkspace {
             sidebar_overlay: None,
             pending_removal_tasks: Vec::new(),
             _serialize_task: None,
-            _subscriptions: vec![release_subscription, settings_subscription],
+            _subscriptions: vec![release_subscription],
             previous_focus_handle: None,
         }
     }
@@ -423,8 +411,8 @@ impl MultiWorkspace {
             .map_or(false, |s| s.is_threads_list_view_active(cx))
     }
 
-    pub fn multi_workspace_enabled(&self, cx: &App) -> bool {
-        !DisableAiSettings::get_global(cx).disable_ai && AgentSettings::get_global(cx).enabled
+    pub fn multi_workspace_enabled(&self, _cx: &App) -> bool {
+        true
     }
 
     pub fn toggle_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1382,27 +1370,6 @@ impl MultiWorkspace {
         let key = self.held[index].workspace.read(cx).project_group_key(cx);
         self.pin(index, key, cx);
         self.serialize(cx);
-        cx.notify();
-    }
-
-    /// Collapses to a single workspace, discarding all groups.
-    /// Used when multi-workspace is disabled by settings.
-    fn collapse_to_single_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.sidebar_open {
-            self.close_sidebar(window, cx);
-        }
-
-        let displayed_workspace = self.workspace().clone();
-        for workspace in self.workspaces().cloned().collect::<Vec<_>>() {
-            if workspace != displayed_workspace {
-                self.detach_workspace(&workspace, cx);
-            }
-        }
-
-        for held in &mut self.held {
-            held.pinned = false;
-        }
-        self.project_groups.clear();
         cx.notify();
     }
 
