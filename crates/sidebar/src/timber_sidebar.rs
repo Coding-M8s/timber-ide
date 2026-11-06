@@ -1,5 +1,9 @@
-use crate::timber_cli::{self, Inventory, WorktreeRecord, display_text};
+use crate::timber_cli::{
+    self, Inventory, MutationCommand, MutationOutcome, WorktreeRecord, display_text,
+};
+use crate::timber_operations::{Operation, OperationPhase, OperationRequest, TimberOperations};
 use anyhow::{Context as _, Result};
+use editor::Editor;
 use futures::{FutureExt as _, future::BoxFuture};
 use gpui::prelude::*;
 use gpui::{
@@ -7,7 +11,7 @@ use gpui::{
     SharedString, Subscription, Task, WeakEntity, Window, px,
 };
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -57,6 +61,10 @@ pub struct TimberSidebar {
     handoff_listener: Option<Task<()>>,
     handoff_binding: Option<HandoffBinding>,
     project_subscription: Option<Subscription>,
+    operations: Entity<TimberOperations>,
+    handled_operations: HashSet<u64>,
+    input: Option<Entity<Editor>>,
+    form_open: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -79,6 +87,18 @@ impl TimberSidebar {
             }),
             cx,
         );
+        sidebar.input = Some(cx.new(|cx| {
+            let mut input = Editor::single_line(window, cx);
+            input.set_placeholder_text("Ticket or branch name", window, cx);
+            input
+        }));
+        let operations = sidebar.operations.clone();
+        sidebar
+            ._subscriptions
+            .push(cx.observe_in(&operations, window, |this, _, window, cx| {
+                this.apply_completed_operations(window, cx);
+                cx.notify();
+            }));
         sidebar.listen_for_terminal_handoffs(window, cx);
         sidebar
     }
@@ -103,6 +123,7 @@ impl TimberSidebar {
         });
         Self::schedule_sync(cx);
         let executor = cx.background_executor().clone();
+        let operations = TimberOperations::global(cx);
         Self {
             multi_workspace: multi_workspace.downgrade(),
             focus_handle: cx.focus_handle(),
@@ -130,8 +151,329 @@ impl TimberSidebar {
             handoff_listener: None,
             handoff_binding: None,
             project_subscription: None,
+            operations,
+            handled_operations: HashSet::new(),
+            input: None,
+            form_open: false,
             _subscriptions: vec![subscription],
         }
+    }
+
+    fn toggle_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.form_open = !self.form_open;
+        if self.form_open {
+            if let Some(input) = &self.input {
+                window.focus(&input.focus_handle(cx), cx);
+            }
+        } else {
+            window.focus(&self.focus_handle, cx);
+        }
+        cx.notify();
+    }
+
+    fn submit_operation(
+        &mut self,
+        command: MutationCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = self
+            .input
+            .as_ref()
+            .map(|input| input.read(cx).text(cx))
+            .unwrap_or_default();
+        self.start_operation(command, input, window, cx);
+    }
+
+    fn start_operation(
+        &mut self,
+        command: MutationCommand,
+        input: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let result = (|| {
+            anyhow::ensure!(
+                !input.trim().is_empty(),
+                "Enter a ticket identifier or branch name."
+            );
+            let inventory = self
+                .inventory
+                .as_ref()
+                .context("Refresh the repository before starting an operation")?;
+            let (workspace, cwd) = self.multi_workspace.read_with(cx, |multi_workspace, cx| {
+                let workspace = multi_workspace.workspace();
+                (
+                    workspace.downgrade(),
+                    workspace
+                        .read(cx)
+                        .root_paths(cx)
+                        .first()
+                        .map(|path| path.to_path_buf()),
+                )
+            })?;
+            let cwd = cwd.context("Open a local repository first")?;
+            let canonical_cwd = inventory
+                .worktrees
+                .iter()
+                .find(|tree| tree.path == cwd || tree.canonical_path.as_ref() == Some(&cwd))
+                .and_then(|tree| tree.canonical_path.clone())
+                .context("Repository path is not verified; refresh before creating a worktree")?;
+            let request = OperationRequest {
+                common_git_dir: inventory.repository.common_git_dir.clone(),
+                cwd,
+                canonical_cwd,
+                reconciliation_cwd: inventory.repository.primary_worktree_root.clone(),
+                command,
+                input,
+                sidebar: cx.entity_id(),
+                generation: self.activation_generation.get(),
+                workspace,
+                window: window
+                    .window_handle()
+                    .downcast::<MultiWorkspace>()
+                    .context("Not a workspace window")?,
+            };
+            self.operations
+                .update(cx, |operations, cx| operations.start(request, cx))?;
+            Ok::<_, anyhow::Error>(())
+        })();
+        self.error = result.err().map(|error| format!("{error:#}").into());
+        cx.notify();
+    }
+
+    fn apply_completed_operations(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let completed = self
+            .operations
+            .read(cx)
+            .operations
+            .iter()
+            .filter(|operation| {
+                operation.request.sidebar == cx.entity_id()
+                    && operation.phase == OperationPhase::Finished
+                    && !self.handled_operations.contains(&operation.id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for operation in completed {
+            self.handled_operations.insert(operation.id);
+            if self.selected_common_git_dir.as_ref() != Some(&operation.request.common_git_dir) {
+                continue;
+            }
+            if let Some(inventory) = operation.inventory.clone() {
+                // Cancel an older listing so it cannot overwrite post-mutation inventory.
+                self.generation.set(self.generation.get().wrapping_add(1));
+                self.refresh_task = None;
+                self.loading = false;
+                self.inventory = Some(inventory);
+            }
+            self.error = operation.error.as_deref().map(display_text).map(Into::into);
+            if operation.request.generation != self.activation_generation.get() {
+                continue;
+            }
+            if operation
+                .result
+                .as_ref()
+                .is_some_and(|result| result.outcome == MutationOutcome::Succeeded)
+            {
+                self.open_operation_result(&operation, window, cx);
+            }
+        }
+    }
+
+    fn operation_target(&self, operation: &Operation) -> Result<WorktreeRecord> {
+        anyhow::ensure!(
+            operation.phase == OperationPhase::Finished,
+            "Refresh operation worktrees first"
+        );
+        anyhow::ensure!(
+            self.selected_common_git_dir.as_ref() == Some(&operation.request.common_git_dir),
+            "Return to the operation's repository to open its result"
+        );
+        let result = operation.result.as_ref().context(
+            "No verified target was returned; inspect refreshed worktrees before retrying",
+        )?;
+        let target = result
+            .worktree
+            .as_ref()
+            .context("Timber did not return a worktree target")?;
+        let inventory = operation
+            .inventory
+            .as_ref()
+            .context("Operation inventory is unavailable")?;
+        let tree = inventory
+            .worktrees
+            .iter()
+            .find(|tree| {
+                tree.path == target.path
+                    && tree.canonical_path.is_some()
+                    && tree.canonical_path == target.canonical_path
+            })
+            .context("The returned worktree is not available in refreshed inventory")?;
+        Ok(tree.clone())
+    }
+
+    fn open_operation_result(
+        &mut self,
+        operation: &Operation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.operation_target(operation) {
+            Ok(tree) => {
+                let form_input = operation
+                    .result
+                    .as_ref()
+                    .filter(|result| {
+                        result.outcome == MutationOutcome::Succeeded && operation.error.is_none()
+                    })
+                    .map(|_| operation.request.input.clone());
+                self.activate_worktree_with_input(tree, None, form_input, window, cx);
+            }
+            Err(error) => {
+                self.error = Some(format!("{error:#}").into());
+                cx.notify();
+            }
+        }
+    }
+
+    fn render_operations(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let operations = self
+            .operations
+            .read(cx)
+            .operations
+            .iter()
+            .filter(|operation| {
+                Some(&operation.request.common_git_dir) == self.selected_common_git_dir.as_ref()
+            })
+            .rev()
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>();
+        div()
+            .id("timber-operations")
+            .max_h(px(240.))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .child(div().text_xs().child("OPERATIONS"))
+            .when(operations.is_empty(), |this| {
+                this.child(div().text_xs().child("No operations yet."))
+            })
+            .children(operations.into_iter().map(|operation| {
+                let id = operation.id;
+                let target_available = self.operation_target(&operation).is_ok();
+                let failed = operation
+                    .result
+                    .as_ref()
+                    .is_some_and(|result| result.outcome == MutationOutcome::Failed);
+                let label = format!(
+                    "#{} {} {}",
+                    id,
+                    operation.request.command.name(),
+                    display_text(&operation.request.input)
+                );
+                let result_operation = operation.clone();
+                let recovery_operation = operation.clone();
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(div().text_xs().child(label))
+                    .child(div().text_xs().child(operation.status()))
+                    .when_some(operation.error.clone(), |this, error| {
+                        this.child(div().text_xs().child(display_text(&error)))
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_1()
+                            .child(
+                                Button::new(("timber-output", id), "Output")
+                                    .disabled(operation.view.is_none())
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        let result =
+                                            this.operations.update(cx, |operations, cx| {
+                                                operations.output(id, window, cx)
+                                            });
+                                        if let Err(error) = result {
+                                            this.error = Some(format!("{error:#}").into());
+                                            cx.notify();
+                                        }
+                                    })),
+                            )
+                            .when(operation.phase == OperationPhase::NeedsRefresh, |this| {
+                                this.child(
+                                    Button::new(("timber-reconcile", id), "Refresh").on_click(
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.operations.update(cx, |operations, cx| {
+                                                operations.reconcile(id, cx)
+                                            });
+                                        }),
+                                    ),
+                                )
+                            })
+                            .when(target_available, |this| {
+                                this.child(
+                                    Button::new(
+                                        ("timber-open-result", id),
+                                        if failed {
+                                            "Open Existing"
+                                        } else {
+                                            "Open Result"
+                                        },
+                                    )
+                                    .on_click(cx.listener(
+                                        move |this, _, window, cx| {
+                                            this.open_operation_result(
+                                                &result_operation,
+                                                window,
+                                                cx,
+                                            );
+                                        },
+                                    )),
+                                )
+                            })
+                            .when(failed && target_available, |this| {
+                                this.child(
+                                    Button::new(("timber-retry-setup", id), "Retry Setup")
+                                        .disabled(
+                                            self.selected_common_git_dir.as_ref().is_some_and(
+                                                |repository| {
+                                                    self.operations.read(cx).busy(repository)
+                                                },
+                                            ),
+                                        )
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            let result = this
+                                                .operation_target(&recovery_operation)
+                                                .and_then(|tree| {
+                                                    tree.path
+                                                        .to_str()
+                                                        .map(ToOwned::to_owned)
+                                                        .context("Worktree path is not UTF-8")
+                                                });
+                                            match result {
+                                                Ok(path) => this.start_operation(
+                                                    MutationCommand::RetrySetup,
+                                                    path,
+                                                    window,
+                                                    cx,
+                                                ),
+                                                Err(error) => {
+                                                    this.error = Some(format!("{error:#}").into());
+                                                    cx.notify();
+                                                }
+                                            }
+                                        })),
+                                )
+                            }),
+                    )
+            }))
     }
 
     fn listen_for_terminal_handoffs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -570,6 +912,34 @@ impl TimberSidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.activate_worktree_with_input(tree, terminal_command, None, window, cx);
+    }
+
+    fn complete_form(
+        &mut self,
+        submitted_input: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(submitted_input) = submitted_input {
+            if let Some(input) = &self.input {
+                if input.read(cx).text(cx) == submitted_input {
+                    input.update(cx, |input, cx| input.set_text("", window, cx));
+                    self.form_open = false;
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    fn activate_worktree_with_input(
+        &mut self,
+        tree: WorktreeRecord,
+        terminal_command: Option<Vec<String>>,
+        form_input: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.cancel_pending_handoff();
         self.activation_generation
             .set(self.activation_generation.get().wrapping_add(1));
@@ -589,6 +959,9 @@ impl TimberSidebar {
             .map(|retained| retained.workspace.clone())
         {
             self.activate_retained(workspace.clone(), window, cx);
+            if self.error.is_none() {
+                self.complete_form(form_input.as_deref(), window, cx);
+            }
             if let Some(command) = terminal_command
                 .clone()
                 .filter(|command| !command.is_empty())
@@ -694,7 +1067,8 @@ impl TimberSidebar {
                         })
                         .detach();
                     }
-                    this.update(cx, |this, cx| {
+                    this.update_in(cx, |this, window, cx| {
+                        this.complete_form(form_input.as_deref(), window, cx);
                         let roots = PathList::new(&workspace.read(cx).root_paths(cx));
                         if roots.paths().len() == 1
                             && roots.paths().first().is_some_and(|root| {
@@ -817,6 +1191,11 @@ impl Render for TimberSidebar {
             .map(|inventory| inventory.worktrees.clone())
             .unwrap_or_default();
         let retained_rows = self.recovery_rows();
+        let busy = self
+            .selected_common_git_dir
+            .as_ref()
+            .is_some_and(|repository| self.operations.read(cx).busy(repository));
+        let operations = self.render_operations(cx);
         div()
             .track_focus(&self.focus_handle)
             .flex()
@@ -832,6 +1211,9 @@ impl Render for TimberSidebar {
                     .justify_between()
                     .text_xs()
                     .child("WORKTREES")
+                    .child(Button::new("timber-new", "New")
+                        .disabled(self.inventory.is_none())
+                        .on_click(cx.listener(|this, _, window, cx| this.toggle_form(window, cx))))
                     .child(
                         Button::new(
                             "timber-refresh",
@@ -850,6 +1232,29 @@ impl Render for TimberSidebar {
                     "Repository from {}",
                     display_text(&cwd.display().to_string())
                 )))
+            })
+            .when(self.form_open, |this| {
+                this.child(div().px_3().py_2().flex().flex_col().gap_2()
+                    .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                        match event.keystroke.key.as_str() {
+                            "escape" => { this.toggle_form(window, cx); cx.stop_propagation(); }
+                            "enter" if this.input.as_ref().is_some_and(|input| input.focus_handle(cx).contains_focused(window, cx)) => {
+                                this.submit_operation(MutationCommand::New, window, cx); cx.stop_propagation();
+                            }
+                            _ => {}
+                        }
+                    }))
+                    .child(div().text_xs().child("Ticket or branch name"))
+                    .when_some(self.input.clone(), |this, input| this.child(input))
+                    .child(div().text_xs().child("Timber resolves the ticket and runs your setup. Agent launch is manual."))
+                    .child(div().flex().flex_wrap().gap_1()
+                        .child(Button::new("timber-create", "Create").disabled(busy)
+                            .on_click(cx.listener(|this, _, window, cx| this.submit_operation(MutationCommand::New, window, cx))))
+                        .child(Button::new("timber-open", "Open").disabled(busy)
+                            .on_click(cx.listener(|this, _, window, cx| this.submit_operation(MutationCommand::Open, window, cx))))
+                        .child(Button::new("timber-cancel", "Cancel")
+                            .on_click(cx.listener(|this, _, window, cx| this.toggle_form(window, cx)))))
+                    .when(busy, |this| this.child(div().text_xs().child("An operation is running for this repository. See Operations for output."))))
             })
             .when_some(self.error.clone(), |this, error| {
                 this.child(div().px_3().py_2().text_sm().child(error))
@@ -925,6 +1330,7 @@ impl Render for TimberSidebar {
                             )
                     })),
             )
+            .child(operations)
     }
 }
 

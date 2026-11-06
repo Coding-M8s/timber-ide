@@ -16582,6 +16582,7 @@ dependencies = [
  "telemetry",
  "tempfile",
  "terminal",
+ "terminal_view",
  "theme",
  "theme_settings",
  "ui",

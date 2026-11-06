@@ -63,6 +63,162 @@ pub(crate) struct Inventory {
     pub worktrees: Vec<WorktreeRecord>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MutationCommand {
+    New,
+    Open,
+    RetrySetup,
+}
+
+impl MutationCommand {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::New => "new",
+            Self::Open | Self::RetrySetup => "open",
+        }
+    }
+
+    pub fn arguments(self, input: &str, result_path: &Path) -> Result<Vec<String>> {
+        let mut arguments = vec![
+            self.name().to_owned(),
+            "--result-file".to_owned(),
+            result_path
+                .to_str()
+                .context("Result path is not UTF-8")?
+                .to_owned(),
+            "--no-editor".to_owned(),
+            "--no-agent".to_owned(),
+        ];
+        if self == Self::RetrySetup {
+            arguments.push("--setup".to_owned());
+        }
+        arguments.extend(["--".to_owned(), input.to_owned()]);
+        Ok(arguments)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum MutationOutcome {
+    Succeeded,
+    Cancelled,
+    Failed,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MutationResult {
+    schema_version: u32,
+    command: String,
+    pub outcome: MutationOutcome,
+    exit_code: i32,
+    #[serde(deserialize_with = "required_option")]
+    repository: Option<RepositoryIdentity>,
+    #[serde(deserialize_with = "required_option")]
+    pub worktree: Option<WorktreeRecord>,
+    pub materialized: bool,
+    #[serde(deserialize_with = "required_option")]
+    pub diagnostic: Option<String>,
+}
+
+pub(crate) fn parse_mutation_result(
+    bytes: &[u8],
+    process_exit: Option<i32>,
+    command: MutationCommand,
+    common_git_dir: &Path,
+) -> Result<MutationResult> {
+    ensure!(
+        bytes.len() <= DIAGNOSTIC_LIMIT * 64,
+        "Timber result exceeded the size limit"
+    );
+    let mut result: MutationResult = serde_json::from_slice(bytes).context(
+        "Timber did not return a complete v1 result; reconcile worktrees before retrying",
+    )?;
+    ensure!(
+        result.schema_version == 1,
+        "Unsupported Timber result schema"
+    );
+    ensure!(
+        result.command == command.name(),
+        "Timber result command mismatch"
+    );
+    ensure!(
+        process_exit == Some(result.exit_code),
+        "Timber process and result exit codes disagree"
+    );
+    match result.outcome {
+        MutationOutcome::Succeeded => ensure!(
+            result.exit_code == 0
+                && result.worktree.is_some()
+                && result.repository.is_some()
+                && result.diagnostic.is_none(),
+            "Invalid successful Timber result"
+        ),
+        MutationOutcome::Cancelled => ensure!(
+            result.exit_code == 0
+                && result.worktree.is_none()
+                && !result.materialized
+                && result.diagnostic.is_none(),
+            "Invalid cancelled Timber result"
+        ),
+        MutationOutcome::Failed => ensure!(
+            result.exit_code == 1 && result.diagnostic.is_some(),
+            "Invalid failed Timber result"
+        ),
+    }
+    if let Some(repository) = &result.repository {
+        ensure!(
+            repository.common_git_dir == common_git_dir,
+            "Timber result belongs to another repository"
+        );
+        ensure!(
+            repository.primary_worktree_root.is_absolute()
+                && repository.current_worktree_root.is_absolute(),
+            "Timber returned relative repository paths"
+        );
+    }
+    ensure!(
+        !result.materialized || result.worktree.is_some(),
+        "Timber omitted the materialized worktree"
+    );
+    if let Some(tree) = &result.worktree {
+        ensure!(
+            result.repository.is_some() && tree.path.is_absolute(),
+            "Timber returned an invalid worktree target"
+        );
+        ensure!(
+            tree.canonical_path
+                .as_ref()
+                .is_none_or(|path| path.is_absolute()),
+            "Timber returned a relative canonical path"
+        );
+        ensure!(
+            tree.detached == tree.branch.is_none(),
+            "Timber returned inconsistent branch identity"
+        );
+    }
+    result.diagnostic = result.diagnostic.as_deref().map(diagnostic_text);
+    Ok(result)
+}
+
+pub(crate) async fn read_mutation_result(
+    path: &Path,
+    process_exit: Option<i32>,
+    command: MutationCommand,
+    common_git_dir: &Path,
+) -> Result<MutationResult> {
+    let metadata = smol::fs::symlink_metadata(path)
+        .await
+        .context("Timber result is missing; refresh before retrying")?;
+    ensure!(
+        metadata.is_file() && metadata.len() <= (DIAGNOSTIC_LIMIT * 64) as u64,
+        "Invalid Timber result file"
+    );
+    let file = smol::fs::File::open(path).await?;
+    let bytes = bounded_output(file, DIAGNOSTIC_LIMIT * 64, true).await?;
+    parse_mutation_result(&bytes, process_exit, command, common_git_dir)
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Envelope {
@@ -472,6 +628,74 @@ mod tests {
                 "isPrimary": true, "detached": false, "pathExists": true, "locked": null, "prunable": null,
                 "status": {"kind": "known", "modified": [], "untracked": [], "ignored": []}}]
         })
+    }
+
+    #[test]
+    fn mutation_arguments_keep_selector_literal_and_suppress_launches() {
+        let input = "--ticket $(touch unexpected) with spaces";
+        for command in [
+            MutationCommand::New,
+            MutationCommand::Open,
+            MutationCommand::RetrySetup,
+        ] {
+            let arguments = command
+                .arguments(input, Path::new("/private result/result.json"))
+                .expect("arguments");
+            assert_eq!(arguments.first().map(String::as_str), Some(command.name()));
+            assert!(arguments.iter().any(|argument| argument == "--no-editor"));
+            assert!(arguments.iter().any(|argument| argument == "--no-agent"));
+            assert_eq!(arguments.last().map(String::as_str), Some(input));
+            assert!(arguments.windows(2).any(|pair| pair == ["--", input]));
+            assert_eq!(
+                arguments.iter().any(|argument| argument == "--setup"),
+                command == MutationCommand::RetrySetup
+            );
+        }
+    }
+
+    #[test]
+    fn mutation_results_preserve_partial_failure_and_require_matching_identity() {
+        let mut value = record();
+        value["command"] = json!("new");
+        value["worktree"] = value["worktrees"][0].clone();
+        value["materialized"] = json!(true);
+        value.as_object_mut().expect("object").remove("worktrees");
+        let parse = |value: &Value, exit_code| {
+            parse_mutation_result(
+                value.to_string().as_bytes(),
+                exit_code,
+                MutationCommand::New,
+                Path::new("/repo/.git"),
+            )
+        };
+        assert_eq!(
+            parse(&value, Some(0)).expect("success").outcome,
+            MutationOutcome::Succeeded
+        );
+        assert!(parse(&value, Some(1)).is_err());
+        value["repository"]["commonGitDir"] = json!("/other/.git");
+        assert!(parse(&value, Some(0)).is_err());
+        value["repository"]["commonGitDir"] = json!("/repo/.git");
+        value["outcome"] = json!("failed");
+        value["exitCode"] = json!(1);
+        value["diagnostic"] = json!("setup failed");
+        let result = parse(&value, Some(1)).expect("partial failure");
+        assert_eq!(result.outcome, MutationOutcome::Failed);
+        assert!(result.materialized);
+        assert_eq!(
+            result.worktree.expect("retained target").path,
+            Path::new("/repo")
+        );
+        value["outcome"] = json!("cancelled");
+        value["exitCode"] = json!(0);
+        value["diagnostic"] = Value::Null;
+        value["worktree"] = Value::Null;
+        value["materialized"] = json!(false);
+        assert_eq!(
+            parse(&value, Some(0)).expect("cancelled").outcome,
+            MutationOutcome::Cancelled
+        );
+        assert!(parse(&value, None).is_err());
     }
 
     #[test]
