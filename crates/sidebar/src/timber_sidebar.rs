@@ -328,7 +328,14 @@ impl TimberSidebar {
                         result.outcome == MutationOutcome::Succeeded && operation.error.is_none()
                     })
                     .map(|_| operation.request.input.clone());
-                self.activate_worktree_with_input(tree, None, form_input, window, cx);
+                self.activate_worktree_with_input(
+                    tree,
+                    None,
+                    form_input,
+                    Some(operation.id),
+                    window,
+                    cx,
+                );
             }
             Err(error) => {
                 self.error = Some(format!("{error:#}").into());
@@ -589,6 +596,52 @@ impl TimberSidebar {
         for project_id in bound {
             terminal::timber_handoff::bind_project(project_id, command.clone(), socket.clone(), cx);
         }
+    }
+
+    fn start_operation_agent(
+        &mut self,
+        operation_id: Option<u64>,
+        workspace: Entity<Workspace>,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(operation_id) = operation_id else {
+            return;
+        };
+        let Some(path_argument) = path.to_str().map(ToOwned::to_owned) else {
+            self.error = Some(
+                "Opened the worktree, but its path cannot be passed to Timber for agent launch."
+                    .into(),
+            );
+            cx.notify();
+            return;
+        };
+        if !self.operations.update(cx, |operations, _| {
+            operations.claim_agent_launch(operation_id)
+        }) {
+            return;
+        }
+        // Reopening an exact existing path resolves the saved workflow and agent in
+        // Timber without rerunning setup or invoking another editor.
+        let command = vec![
+            "timber".to_owned(),
+            "open".to_owned(),
+            "--agent".to_owned(),
+            "--no-editor".to_owned(),
+            "--".to_owned(),
+            path_argument,
+        ];
+        let operations = self.operations.clone();
+        cx.spawn_in(window, async move |sidebar, cx| {
+            if !open_agent_terminal(workspace, path, command, cx).await {
+                operations.update(cx, |operations, _| {
+                    operations.release_agent_launch(operation_id)
+                });
+                report_missing_agent_terminal(&sidebar, cx);
+            }
+        })
+        .detach();
     }
 
     fn queue_agent_terminal(
@@ -912,7 +965,7 @@ impl TimberSidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.activate_worktree_with_input(tree, terminal_command, None, window, cx);
+        self.activate_worktree_with_input(tree, terminal_command, None, None, window, cx);
     }
 
     fn complete_form(
@@ -937,6 +990,7 @@ impl TimberSidebar {
         tree: WorktreeRecord,
         terminal_command: Option<Vec<String>>,
         form_input: Option<String>,
+        operation_id: Option<u64>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -961,6 +1015,15 @@ impl TimberSidebar {
             self.activate_retained(workspace.clone(), window, cx);
             if self.error.is_none() {
                 self.complete_form(form_input.as_deref(), window, cx);
+                if let Some(workspace) = workspace.upgrade() {
+                    self.start_operation_agent(
+                        operation_id,
+                        workspace,
+                        tree.path.clone(),
+                        window,
+                        cx,
+                    );
+                }
             }
             if let Some(command) = terminal_command
                 .clone()
@@ -1069,6 +1132,13 @@ impl TimberSidebar {
                     }
                     this.update_in(cx, |this, window, cx| {
                         this.complete_form(form_input.as_deref(), window, cx);
+                        this.start_operation_agent(
+                            operation_id,
+                            workspace.clone(),
+                            tree.path.clone(),
+                            window,
+                            cx,
+                        );
                         let roots = PathList::new(&workspace.read(cx).root_paths(cx));
                         if roots.paths().len() == 1
                             && roots.paths().first().is_some_and(|root| {
@@ -1108,7 +1178,7 @@ fn report_missing_agent_terminal(
     sidebar
         .update(cx, |sidebar, cx| {
             sidebar.error =
-                Some("Opened the worktree, but its terminal was not ready for the agent.".into());
+                Some("The agent command could not start or exited unsuccessfully. Inspect its terminal output; Open Result can retry the launch.".into());
             cx.notify();
         })
         .log_err();
@@ -1136,36 +1206,46 @@ async fn open_agent_terminal(
                 .await;
             continue;
         }
-        return workspace
-            .update_in(cx, |workspace, window, cx| {
-                workspace
-                    .spawn_in_terminal(
-                        task::SpawnInTerminal {
-                            id: task::TaskId(format!("timber-agent-{command_label}-{cwd:?}")),
-                            full_label: command_label.clone(),
-                            label: program.clone(),
-                            command: Some(program.clone()),
-                            args: args.clone(),
-                            command_label: command_label.clone(),
-                            cwd: Some(cwd.clone()),
-                            env: HashMap::default(),
-                            use_new_terminal: true,
-                            allow_concurrent_runs: true,
-                            reveal: task::RevealStrategy::Always,
-                            reveal_target: task::RevealTarget::Dock,
-                            hide: task::HideStrategy::Never,
-                            shell: task::Shell::System,
-                            show_summary: false,
-                            show_command: true,
-                            show_rerun: false,
-                            save: task::SaveStrategy::None,
-                        },
-                        window,
-                        cx,
-                    )
-                    .detach();
-            })
-            .is_ok();
+        let task = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.spawn_in_terminal(
+                task::SpawnInTerminal {
+                    id: task::TaskId(format!("timber-agent-{command_label}-{cwd:?}")),
+                    full_label: command_label.clone(),
+                    label: program.clone(),
+                    command: Some(program.clone()),
+                    args: args.clone(),
+                    command_label: command_label.clone(),
+                    cwd: Some(cwd.clone()),
+                    env: HashMap::default(),
+                    use_new_terminal: true,
+                    allow_concurrent_runs: true,
+                    reveal: task::RevealStrategy::Always,
+                    reveal_target: task::RevealTarget::Dock,
+                    hide: task::HideStrategy::Never,
+                    shell: task::Shell::System,
+                    show_summary: false,
+                    show_command: true,
+                    show_rerun: false,
+                    save: task::SaveStrategy::None,
+                },
+                window,
+                cx,
+            )
+        });
+        return match task {
+            Ok(task) => match task.await {
+                Some(Ok(status)) => status.success(),
+                Some(Err(error)) => {
+                    log::error!("Timber agent terminal failed: {error:#}");
+                    false
+                }
+                None => false,
+            },
+            Err(error) => {
+                log::error!("Could not attach Timber agent terminal: {error:#}");
+                false
+            }
+        };
     }
     false
 }
@@ -1246,7 +1326,7 @@ impl Render for TimberSidebar {
                     }))
                     .child(div().text_xs().child("Ticket or branch name"))
                     .when_some(self.input.clone(), |this, input| this.child(input))
-                    .child(div().text_xs().child("Timber resolves the ticket and runs your setup. Agent launch is manual."))
+                    .child(div().text_xs().child("Timber resolves the ticket, runs setup, and opens your configured agent in the worktree."))
                     .child(div().flex().flex_wrap().gap_1()
                         .child(Button::new("timber-create", "Create").disabled(busy)
                             .on_click(cx.listener(|this, _, window, cx| this.submit_operation(MutationCommand::New, window, cx))))
