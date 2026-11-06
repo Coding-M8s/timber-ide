@@ -1203,6 +1203,35 @@ impl MultiWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Workspace>>> {
+        self.find_or_create_local_workspace_guarded(
+            path_list,
+            project_group,
+            init,
+            open_mode,
+            source_workspace,
+            crate::LocalWorkspaceOpenGuard {
+                is_current: Rc::new(|| true),
+                validate_paths: None,
+            },
+            window,
+            cx,
+        )
+    }
+
+    pub fn find_or_create_local_workspace_guarded(
+        &mut self,
+        path_list: PathList,
+        project_group: Option<ProjectGroupKey>,
+        init: Option<Box<dyn FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + Send>>,
+        open_mode: OpenMode,
+        source_workspace: Option<WeakEntity<Workspace>>,
+        activation_guard: crate::LocalWorkspaceOpenGuard,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Workspace>>> {
+        if !(activation_guard.is_current)() {
+            return Task::ready(Err(anyhow::anyhow!("Workspace selection changed")));
+        }
         if let Some(workspace) = self.workspace_for_paths(&path_list, None, cx) {
             self.activate(workspace.clone(), source_workspace, window, cx);
             return Task::ready(Ok(workspace));
@@ -1240,6 +1269,9 @@ impl MultiWorkspace {
             if let Some(requesting_window) = requesting_window
                 && let Some(workspace) = requesting_window
                     .update(cx, |multi_workspace, window, cx| {
+                        if !(activation_guard.is_current)() {
+                            return None;
+                        }
                         multi_workspace
                             .workspace_for_paths(&effective_path_list, None, cx)
                             .inspect(|workspace| {
@@ -1257,15 +1289,20 @@ impl MultiWorkspace {
                 return Ok(workspace);
             }
 
+            anyhow::ensure!(
+                (activation_guard.is_current)(),
+                "Workspace selection changed"
+            );
             let result = cx
                 .update(|cx| {
-                    Workspace::new_local(
+                    Workspace::new_local_guarded(
                         effective_path_list.paths().to_vec(),
                         app_state,
                         requesting_window,
                         None,
                         init,
                         open_mode,
+                        activation_guard,
                         cx,
                     )
                 })
