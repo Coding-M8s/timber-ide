@@ -1911,3 +1911,95 @@ async fn test_restoring_inactive_workspace_does_not_take_focus(cx: &mut TestAppC
         assert!(workspace.focus_handle(cx).contains_focused(window, cx));
     });
 }
+
+#[gpui::test]
+async fn forgetting_deleted_worktree_closes_dirty_workspace_without_prompt(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let filesystem = FakeFs::new(cx.executor());
+    filesystem
+        .insert_tree("/primary", json!({ "file": "A" }))
+        .await;
+    filesystem
+        .insert_tree("/linked", json!({ "file": "B" }))
+        .await;
+    let primary = Project::test(filesystem.clone(), ["/primary".as_ref()], cx).await;
+    let linked = Project::test(filesystem.clone(), ["/linked".as_ref()], cx).await;
+    let (multi_workspace, cx) = setup_multi_workspace(&[primary, linked], cx);
+    let workspace =
+        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+    let item = cx.new(|cx| TestItem::new(cx).with_dirty(true));
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
+    });
+    filesystem
+        .remove_dir(
+            "/linked".as_ref(),
+            fs::RemoveOptions {
+                recursive: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("remove disposable root");
+    let removed = multi_workspace
+        .update_in(cx, |multi_workspace, window, cx| {
+            multi_workspace.remove(
+                vec![workspace.clone()],
+                RemovalIntent::DeletedWorktree,
+                window,
+                cx,
+            )
+        })
+        .await
+        .expect("forget deleted workspace without a prompt");
+    assert!(removed);
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(multi_workspace.workspaces().count(), 1);
+        assert_eq!(
+            multi_workspace
+                .workspace()
+                .read(cx)
+                .root_paths(cx)
+                .first()
+                .map(|path| path.as_ref()),
+            Some(std::path::Path::new("/primary"))
+        );
+    });
+    assert!(
+        filesystem
+            .metadata("/linked".as_ref())
+            .await
+            .expect("metadata")
+            .is_none()
+    );
+}
+
+#[gpui::test]
+async fn forgetting_worktree_refuses_an_existing_path(cx: &mut TestAppContext) {
+    init_test(cx);
+    let filesystem = FakeFs::new(cx.executor());
+    filesystem
+        .insert_tree("/linked", json!({ "file": "B" }))
+        .await;
+    let project = Project::test(filesystem, ["/linked".as_ref()], cx).await;
+    let (multi_workspace, cx) = setup_multi_workspace(&[project], cx);
+    let workspace =
+        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+    let result = multi_workspace
+        .update_in(cx, |multi_workspace, window, cx| {
+            multi_workspace.remove(
+                vec![workspace.clone()],
+                RemovalIntent::DeletedWorktree,
+                window,
+                cx,
+            )
+        })
+        .await;
+    assert!(result.is_err());
+    multi_workspace.read_with(cx, |multi_workspace, _| {
+        assert_eq!(multi_workspace.workspace(), &workspace);
+        assert_eq!(multi_workspace.workspaces().count(), 1);
+    });
+}

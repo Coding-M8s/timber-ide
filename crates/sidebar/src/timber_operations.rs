@@ -1,4 +1,6 @@
-use crate::timber_cli::{self, Inventory, MutationCommand, MutationOutcome, MutationResult};
+use crate::timber_cli::{
+    self, CleanupPreview, Inventory, MutationCommand, MutationOutcome, MutationResult,
+};
 use anyhow::{Context as _, Result, ensure};
 use gpui::{
     App, AppContext as _, Context, Entity, EntityId, Global, Subscription, WeakEntity, Window,
@@ -17,6 +19,7 @@ pub(crate) struct OperationRequest {
     pub canonical_cwd: PathBuf,
     pub reconciliation_cwd: PathBuf,
     pub command: MutationCommand,
+    pub cleanup: Option<CleanupPreview>,
     pub input: String,
     pub sidebar: EntityId,
     pub generation: u64,
@@ -40,6 +43,7 @@ pub(crate) struct Operation {
     pub result: Option<MutationResult>,
     pub inventory: Option<Inventory>,
     pub error: Option<String>,
+    pub reconciliation_error: Option<String>,
     pub terminal: Option<Entity<Terminal>>,
     pub view: Option<Entity<TerminalView>>,
     interrupted: bool,
@@ -152,7 +156,39 @@ impl TimberOperations {
             .prefix("timber-operation-")
             .tempdir()?;
         let result_path = directory.path().join("result.json");
-        let arguments = request.command.arguments(&request.input, &result_path)?;
+        let approval_path = directory.path().join("cleanup-approval.json");
+        let arguments = if request.command == MutationCommand::Done {
+            let preview = request
+                .cleanup
+                .as_ref()
+                .context("Review the cleanup preview first")?;
+            ensure!(
+                preview.tree.path.to_str() == Some(request.input.as_str()),
+                "Cleanup target changed"
+            );
+            vec![
+                "__ide-done".to_owned(),
+                "apply".to_owned(),
+                "--approval-file".to_owned(),
+                approval_path
+                    .to_str()
+                    .context("Approval path is not UTF-8")?
+                    .to_owned(),
+                "--result-file".to_owned(),
+                result_path
+                    .to_str()
+                    .context("Result path is not UTF-8")?
+                    .to_owned(),
+                "--".to_owned(),
+                request.input.clone(),
+            ]
+        } else {
+            ensure!(
+                request.cleanup.is_none(),
+                "Cleanup approval supplied to another operation"
+            );
+            request.command.arguments(&request.input, &result_path)?
+        };
         let workspace = request
             .workspace
             .upgrade()
@@ -186,6 +222,7 @@ impl TimberOperations {
             result: None,
             inventory: None,
             error: None,
+            reconciliation_error: None,
             terminal: None,
             view: None,
             interrupted: false,
@@ -194,6 +231,9 @@ impl TimberOperations {
         let operations = cx.entity();
         cx.spawn(async move |_, cx| {
             let result = async {
+                if let Some(preview) = &request.cleanup {
+                    smol::fs::write(&approval_path, serde_json::to_vec(&preview.approval)?).await?;
+                }
                 let timer = cx.background_executor().timer(timber_cli::TIMEOUT);
                 cx.background_spawn({
                     let request = request.clone();
@@ -257,8 +297,8 @@ impl TimberOperations {
                 let attached = request
                     .window
                     .update(cx, |multi_workspace, window, cx| {
-                        let take_focus = multi_workspace.workspace().entity_id()
-                            == request.workspace.entity_id();
+                        let take_focus = request.command != MutationCommand::Done
+                            && multi_workspace.workspace().entity_id() == request.workspace.entity_id();
                         let view = request.workspace.update(cx, |workspace, cx| {
                             let panel = workspace
                                 .panel::<TerminalPanel>(cx)
@@ -369,7 +409,8 @@ impl TimberOperations {
         let Some(operation) = self.operation_mut(id) else {
             return false;
         };
-        if operation.agent_started
+        if operation.request.command == MutationCommand::Done
+            || operation.agent_started
             || operation.phase != OperationPhase::Finished
             || operation.error.is_some()
             || !operation
@@ -413,6 +454,7 @@ impl TimberOperations {
         });
         match inventory {
             Ok(inventory) => {
+                operation.reconciliation_error = None;
                 operation.inventory = Some(inventory);
                 operation.phase = OperationPhase::Finished;
                 let repository = operation.request.common_git_dir.clone();
@@ -420,7 +462,7 @@ impl TimberOperations {
             }
             Err(error) => {
                 let previous = operation.error.as_deref().unwrap_or("Command exited");
-                operation.error = Some(format!(
+                operation.reconciliation_error = Some(format!(
                     "{previous}. Could not reconcile worktrees: {error:#}"
                 ));
                 operation.phase = OperationPhase::NeedsRefresh;
