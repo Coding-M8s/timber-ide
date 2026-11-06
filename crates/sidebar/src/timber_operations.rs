@@ -43,6 +43,7 @@ pub(crate) struct Operation {
     pub terminal: Option<Entity<Terminal>>,
     pub view: Option<Entity<TerminalView>>,
     interrupted: bool,
+    agent_started: bool,
 }
 
 impl Operation {
@@ -188,6 +189,7 @@ impl TimberOperations {
             terminal: None,
             view: None,
             interrupted: false,
+            agent_started: false,
         });
         let operations = cx.entity();
         cx.spawn(async move |_, cx| {
@@ -312,9 +314,15 @@ impl TimberOperations {
                     });
                 }
                 let status = completion_receiver.recv().await.ok().flatten();
+                let exit_code = status.and_then(|status| status.code());
+                terminal.update(cx, |terminal, cx| {
+                    let exit = exit_code.map(|code| format!("exit {code}"))
+                        .unwrap_or_else(|| "interrupted".to_owned());
+                    terminal.write_output(format!("\r\n[Timber command finished: {exit}. Saved command output.]\r\n\x1b[?25l").as_bytes(), cx);
+                });
                 timber_cli::read_mutation_result(
                     &result_path,
-                    status.and_then(|status| status.code()),
+                    exit_code,
                     request.command,
                     &request.common_git_dir,
                 )
@@ -355,6 +363,30 @@ impl TimberOperations {
         });
         cx.notify();
         Ok(id)
+    }
+
+    pub fn claim_agent_launch(&mut self, id: u64) -> bool {
+        let Some(operation) = self.operation_mut(id) else {
+            return false;
+        };
+        if operation.agent_started
+            || operation.phase != OperationPhase::Finished
+            || operation.error.is_some()
+            || !operation
+                .result
+                .as_ref()
+                .is_some_and(|result| result.outcome == MutationOutcome::Succeeded)
+        {
+            return false;
+        }
+        operation.agent_started = true;
+        true
+    }
+
+    pub fn release_agent_launch(&mut self, id: u64) {
+        if let Some(operation) = self.operation_mut(id) {
+            operation.agent_started = false;
+        }
     }
 
     fn operation_mut(&mut self, id: u64) -> Option<&mut Operation> {
