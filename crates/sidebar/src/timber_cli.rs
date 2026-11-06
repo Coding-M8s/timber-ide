@@ -1,6 +1,6 @@
 use anyhow::{Context as _, Result, bail, ensure};
 use futures::{AsyncRead, AsyncReadExt as _};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -63,11 +63,131 @@ pub(crate) struct Inventory {
     pub worktrees: Vec<WorktreeRecord>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CleanupOptions {
+    pub keep_branch: bool,
+    pub discard_ignored: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CleanupPreview {
+    pub approval: serde_json::Value,
+    pub tree: WorktreeRecord,
+}
+
+fn parse_cleanup_preview(
+    approval: serde_json::Value,
+    repository: &Path,
+    selected: &WorktreeRecord,
+    options: &CleanupOptions,
+) -> Result<CleanupPreview> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Preview {
+        schema_version: u32,
+        snapshot: String,
+        expires_at: u64,
+        repository: RepositoryIdentity,
+        worktree: WorktreeRecord,
+        options: CleanupOptions,
+    }
+    let preview: Preview = serde_json::from_value(approval.clone())
+        .context("Timber did not return a supported cleanup preview. Update Timber and retry.")?;
+    ensure!(
+        preview.schema_version == 1
+            && preview.snapshot.len() == 64
+            && preview
+                .snapshot
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit()),
+        "Unsupported cleanup preview"
+    );
+    ensure!(
+        preview.expires_at
+            > std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis() as u64,
+        "Cleanup preview expired. Review it again."
+    );
+    ensure!(
+        preview.repository.common_git_dir == repository && preview.options == *options,
+        "Cleanup preview belongs to another repository or settings changed"
+    );
+    ensure!(
+        !preview.worktree.is_primary
+            && preview.worktree.path_exists
+            && preview.worktree.path == selected.path
+            && preview.worktree.canonical_path.is_some()
+            && preview.worktree.canonical_path == selected.canonical_path
+            && preview.worktree.head == selected.head
+            && preview.worktree.branch == selected.branch,
+        "Worktree changed since selection. Refresh the worktrees and try again."
+    );
+    Ok(CleanupPreview {
+        approval,
+        tree: preview.worktree,
+    })
+}
+
+pub(crate) async fn preview_cleanup(
+    cwd: PathBuf,
+    repository: PathBuf,
+    selected: WorktreeRecord,
+    options: CleanupOptions,
+    timeout: impl std::future::Future<Output = ()>,
+) -> Result<CleanupPreview> {
+    with_timeout(
+        async {
+            let mut arguments = vec!["__ide-done".to_owned(), "preview".to_owned()];
+            if options.keep_branch {
+                arguments.push("--keep-branch".to_owned());
+            }
+            if !options.discard_ignored {
+                arguments.push("--keep-ignored".to_owned());
+            }
+            if let Some(base) = &options.base {
+                arguments.extend(["--base".to_owned(), base.clone()]);
+            }
+            arguments.extend([
+                "--".to_owned(),
+                selected
+                    .path
+                    .to_str()
+                    .context("Worktree path is not UTF-8")?
+                    .to_owned(),
+            ]);
+            let arguments: Vec<_> = arguments.iter().map(OsStr::new).collect();
+            let output = command_output(Path::new("timber"), &arguments, &cwd).await?;
+            ensure!(
+                output.status.success(),
+                "Cannot preview cleanup: {}. Update Timber if native cleanup is unavailable.",
+                display_text(&String::from_utf8_lossy(&output.stderr))
+            );
+            ensure!(
+                output.stdout.len() <= DIAGNOSTIC_LIMIT * 64,
+                "Cleanup preview exceeded the size limit"
+            );
+            parse_cleanup_preview(
+                serde_json::from_slice(&output.stdout)?,
+                &repository,
+                &selected,
+                &options,
+            )
+        },
+        timeout,
+    )
+    .await
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MutationCommand {
     New,
     Open,
     RetrySetup,
+    Done,
 }
 
 impl MutationCommand {
@@ -75,10 +195,12 @@ impl MutationCommand {
         match self {
             Self::New => "new",
             Self::Open | Self::RetrySetup => "open",
+            Self::Done => "done",
         }
     }
 
     pub fn arguments(self, input: &str, result_path: &Path) -> Result<Vec<String>> {
+        ensure!(self != Self::Done, "Cleanup requires an approved preview");
         let mut arguments = vec![
             self.name().to_owned(),
             "--result-file".to_owned(),
@@ -628,6 +750,57 @@ mod tests {
                 "isPrimary": true, "detached": false, "pathExists": true, "locked": null, "prunable": null,
                 "status": {"kind": "known", "modified": [], "untracked": [], "ignored": []}}]
         })
+    }
+
+    #[test]
+    fn cleanup_preview_rejects_changed_target_options_and_repository() {
+        let inventory = parse_inventory(&serde_json::to_vec(&record()).expect("fixture"), Some(0))
+            .expect("inventory");
+        let mut tree = inventory.worktrees.first().expect("tree").clone();
+        tree.is_primary = false;
+        let options = CleanupOptions {
+            keep_branch: true,
+            discard_ignored: true,
+            base: None,
+        };
+        let mut value = json!({ "schemaVersion": 1, "snapshot": "a".repeat(64), "expiresAt": 9999999999999_u64,
+            "repository": record()["repository"], "worktree": record()["worktrees"][0], "options": options });
+        value["worktree"]["isPrimary"] = json!(false);
+        let preview = parse_cleanup_preview(
+            value.clone(),
+            &inventory.repository.common_git_dir,
+            &tree,
+            &options,
+        )
+        .expect("preview");
+        assert_eq!(
+            preview.approval, value,
+            "preserve the full CLI approval unchanged"
+        );
+        for pointer in [
+            "/repository/commonGitDir",
+            "/worktree/path",
+            "/worktree/head",
+            "/options/keepBranch",
+        ] {
+            let mut changed = value.clone();
+            *changed.pointer_mut(pointer).expect("fixture field") =
+                if pointer == "/options/keepBranch" {
+                    json!(false)
+                } else {
+                    json!("changed")
+                };
+            assert!(
+                parse_cleanup_preview(
+                    changed,
+                    &inventory.repository.common_git_dir,
+                    &tree,
+                    &options
+                )
+                .is_err(),
+                "{pointer}"
+            );
+        }
     }
 
     #[test]

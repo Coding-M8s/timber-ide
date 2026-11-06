@@ -1,5 +1,6 @@
 mod thread_switcher;
 mod timber_cli;
+mod timber_delete;
 mod timber_operations;
 mod timber_sidebar;
 

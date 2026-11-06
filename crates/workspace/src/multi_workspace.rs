@@ -290,6 +290,8 @@ pub struct ProjectGroupState {
 pub enum RemovalIntent {
     KeepProject,
     CloseProject,
+    /// The caller already confirmed discarding editors for a verified deleted worktree.
+    DeletedWorktree,
 }
 
 /// One row per workspace held by this window. The displayed workspace is
@@ -1764,8 +1766,9 @@ impl MultiWorkspace {
 
     /// Removes one or more workspaces from this multi-workspace.
     ///
-    /// Every workspace is first asked for consent (save prompts); no state
-    /// changes until all consent. The rows are then deleted and, when the
+    /// Workspaces are first asked for consent (save prompts); no state
+    /// changes until all consent. `DeletedWorktree` instead requires already-missing
+    /// roots and uses the caller's prior confirmation to discard editor state. The rows are then deleted and, when the
     /// displayed workspace was among them, a replacement is chosen from what
     /// remains: another workspace in the same project, then a workspace in the
     /// nearest neighboring project, then an empty workspace. When the intent is
@@ -1812,7 +1815,34 @@ impl MultiWorkspace {
         cx.spawn_in(window, async move |this, cx| {
             // Consent phase: run the standard close lifecycle for every
             // workspace being removed. Prompts only; no state changes.
+            let mut deleted_roots = Vec::new();
+            let mut deleted_workspace_ids = Vec::new();
             for workspace in &workspaces {
+                if intent == RemovalIntent::DeletedWorktree {
+                    let (filesystem, roots, database_id, is_local) =
+                        workspace.read_with(cx, |workspace, cx| {
+                            (
+                                workspace.project().read(cx).fs().clone(),
+                                workspace.root_paths(cx),
+                                workspace.database_id(),
+                                workspace.project().read(cx).is_local(),
+                            )
+                        });
+                    anyhow::ensure!(is_local, "Only a local deleted workspace can be forgotten");
+                    anyhow::ensure!(
+                        roots.len() == 1,
+                        "Only a deleted single-root workspace can be forgotten"
+                    );
+                    for root in &roots {
+                        anyhow::ensure!(
+                            filesystem.metadata(root).await?.is_none(),
+                            "The workspace path exists again; its editors were kept"
+                        );
+                    }
+                    deleted_roots.push((workspace.clone(), PathList::new(&roots), filesystem));
+                    deleted_workspace_ids.extend(database_id);
+                    continue;
+                }
                 let should_continue = workspace
                     .update_in(cx, |workspace, window, cx| {
                         workspace.prepare_to_close(CloseIntent::ReplaceWindow, window, cx)
@@ -1827,18 +1857,42 @@ impl MultiWorkspace {
             // Edit phase: one synchronous update. Delete the rows, then pick
             // the replacement from the rows that actually remain.
             let (removed_any, reopen_key) = this.update_in(cx, |this, window, cx| {
+                if deleted_roots.iter().any(|(workspace, roots, filesystem)| {
+                    PathList::new(&workspace.read(cx).root_paths(cx)) != *roots
+                        || roots
+                            .paths()
+                            .iter()
+                            .any(|path| filesystem.path_exists(path))
+                }) {
+                    return (false, None);
+                }
                 let mut removed_any = false;
                 let displayed_workspace = this.workspace().clone();
 
                 // wait for should_continue to be true before removing project groups
-                if intent == RemovalIntent::CloseProject {
+                if matches!(
+                    intent,
+                    RemovalIntent::CloseProject | RemovalIntent::DeletedWorktree
+                ) {
                     let workspace_to_delete_keys = workspaces
                         .iter()
                         .map(|workspace| workspace.read(cx).project_group_key(cx))
                         .collect::<Vec<_>>();
 
-                    this.project_groups
-                        .retain(|group| !workspace_to_delete_keys.contains(&group.key));
+                    this.project_groups.retain(|group| {
+                        if !workspace_to_delete_keys.contains(&group.key) {
+                            return true;
+                        }
+                        intent == RemovalIntent::DeletedWorktree
+                            && (!deleted_roots
+                                .iter()
+                                .any(|(_, roots, _)| group.key.path_list() == roots)
+                                || this.held.iter().any(|held| {
+                                    !workspaces.contains(&held.workspace)
+                                        && held.workspace.read(cx).project_group_key(cx)
+                                            == group.key
+                                }))
+                    });
                     cx.emit(MultiWorkspaceEvent::ProjectGroupsChanged);
                 }
 
@@ -1877,7 +1931,7 @@ impl MultiWorkspace {
                                 .find_map(|key| this.live_member_for_group(key, doomed, cx))
                         })
                         .unwrap_or_else(|| {
-                            if reopen_key.is_none() {
+                            if intent != RemovalIntent::DeletedWorktree && reopen_key.is_none() {
                                 reopen_key = adjacent_key.clone().filter(|key| {
                                     key.host().is_none() && !key.path_list().is_empty()
                                 });
@@ -1915,6 +1969,12 @@ impl MultiWorkspace {
                 (removed_any, reopen_key)
             })?;
 
+            if removed_any && intent == RemovalIntent::DeletedWorktree {
+                let database = cx.update(|_, cx| crate::persistence::WorkspaceDb::global(cx))?;
+                for workspace_id in deleted_workspace_ids {
+                    database.delete_workspace_by_id(workspace_id).await?;
+                }
+            }
             if let Some(key) = reopen_key {
                 this.update_in(cx, |this, window, cx| {
                     this.find_or_create_local_workspace(
