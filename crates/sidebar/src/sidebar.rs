@@ -1,6 +1,8 @@
 mod thread_switcher;
+mod timber_cli;
 mod timber_sidebar;
 
+pub use terminal::timber_handoff::forward_if_requested as forward_timber_open_if_requested;
 pub use timber_sidebar::TimberSidebar;
 
 use acp_thread::ThreadStatus;

@@ -1,4 +1,5 @@
 mod mappings;
+pub mod timber_handoff;
 
 mod alacritty;
 mod pty_info;
@@ -1121,6 +1122,10 @@ impl TerminalBuilder {
             Ok(signal_mask) => Some(signal_mask),
             Err(error) => return Task::ready(Err(error)),
         };
+        let mut handoff_env = std::collections::HashMap::new();
+        // Spawn sites pass the Project entity id here, not the GPUI window id.
+        timber_handoff::insert_terminal_env(window_id, is_remote_terminal, &mut handoff_env, cx);
+        env.extend(handoff_env);
         let fut = async move {
             let (task, completion_tx) = match mode.0 {
                 TerminalModeKind::Interactive => (None, None),

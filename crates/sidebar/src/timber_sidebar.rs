@@ -1,67 +1,799 @@
+use crate::timber_cli::{self, Inventory, WorktreeRecord, display_text};
+use anyhow::{Context as _, Result};
+use futures::{FutureExt as _, future::BoxFuture};
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, Focusable, Pixels, Render, SharedString,
-    WeakEntity, Window, px,
+    App, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, Pixels, Render,
+    SharedString, Subscription, Task, WeakEntity, Window, px,
 };
+use std::cell::Cell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::Arc;
 use ui::ActiveTheme as _;
 use ui::{Button, prelude::*};
 use util::ResultExt as _;
 use util::path_list::PathList;
-use workspace::{MultiWorkspace, OpenMode, Sidebar as WorkspaceSidebar, SidebarEvent, SidebarSide};
+use workspace::{
+    MultiWorkspace, MultiWorkspaceEvent, OpenMode, Sidebar as WorkspaceSidebar, SidebarEvent,
+    SidebarSide, Workspace,
+};
+
+type InventoryLoader = Arc<dyn Fn(PathBuf) -> BoxFuture<'static, Result<Inventory>> + Send + Sync>;
+type WorktreeVerifier =
+    Arc<dyn Fn(PathBuf, PathBuf, PathBuf) -> BoxFuture<'static, Result<()>> + Send + Sync>;
+
+struct RetainedWorktree {
+    workspace: WeakEntity<Workspace>,
+    common_git_dir: PathBuf,
+    roots: PathList,
+    tree: WorktreeRecord,
+}
+
+struct HandoffBinding {
+    command: PathBuf,
+    socket: PathBuf,
+    project_ids_by_workspace: HashMap<EntityId, u64>,
+}
 
 pub struct TimberSidebar {
     multi_workspace: WeakEntity<MultiWorkspace>,
     focus_handle: FocusHandle,
     width: Pixels,
-    worktree_paths: Vec<PathBuf>,
+    cwd: Option<PathBuf>,
+    inventory: Option<Inventory>,
+    selected_common_git_dir: Option<PathBuf>,
+    retained: HashMap<EntityId, RetainedWorktree>,
     error: Option<SharedString>,
+    loading: bool,
+    generation: Rc<Cell<u64>>,
+    activation_generation: Rc<Cell<u64>>,
+    loader: InventoryLoader,
+    verifier: WorktreeVerifier,
+    refresh_task: Option<Task<()>>,
+    activation_tasks: Vec<Task<()>>,
+    handoff_task: Option<Task<()>>,
+    handoff_listener: Option<Task<()>>,
+    handoff_binding: Option<HandoffBinding>,
+    project_subscription: Option<Subscription>,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl TimberSidebar {
-    pub fn new(multi_workspace: Entity<MultiWorkspace>, cx: &mut Context<Self>) -> Self {
-        let worktree_paths = std::env::var_os("TIMBER_WORKTREE_PATHS")
-            .map(|paths| std::env::split_paths(&paths).collect())
-            .unwrap_or_default();
+    pub fn new(
+        multi_workspace: Entity<MultiWorkspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let executor = cx.background_executor().clone();
+        let mut sidebar = Self::with_loader(
+            multi_workspace,
+            Arc::new(move |cwd| {
+                timber_cli::list_worktrees(
+                    PathBuf::from("timber"),
+                    cwd,
+                    executor.timer(timber_cli::TIMEOUT),
+                )
+                .boxed()
+            }),
+            cx,
+        );
+        sidebar.listen_for_terminal_handoffs(window, cx);
+        sidebar
+    }
+
+    fn with_loader(
+        multi_workspace: Entity<MultiWorkspace>,
+        loader: InventoryLoader,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let subscription = cx.subscribe(&multi_workspace, |this, _, event, cx| match event {
+            MultiWorkspaceEvent::ActiveWorkspaceChanged { .. } => {
+                this.activation_generation
+                    .set(this.activation_generation.get().wrapping_add(1));
+                this.cancel_pending_handoff();
+                this.sync_handoff_projects(cx);
+                Self::schedule_sync(cx);
+            }
+            MultiWorkspaceEvent::WorkspaceAdded(_) | MultiWorkspaceEvent::WorkspaceRemoved(_) => {
+                this.sync_handoff_projects(cx);
+            }
+            MultiWorkspaceEvent::ProjectGroupsChanged => {}
+        });
+        Self::schedule_sync(cx);
+        let executor = cx.background_executor().clone();
         Self {
             multi_workspace: multi_workspace.downgrade(),
             focus_handle: cx.focus_handle(),
             width: px(240.),
-            worktree_paths,
+            cwd: None,
+            inventory: None,
+            selected_common_git_dir: None,
+            retained: HashMap::new(),
             error: None,
+            loading: false,
+            generation: Rc::new(Cell::new(0)),
+            activation_generation: Rc::new(Cell::new(0)),
+            loader,
+            verifier: Arc::new(move |path, common_git_dir, canonical_path| {
+                let timer = executor.timer(timber_cli::TIMEOUT);
+                async move {
+                    timber_cli::verify_worktree(&path, &common_git_dir, &canonical_path, timer)
+                        .await
+                }
+                .boxed()
+            }),
+            refresh_task: None,
+            activation_tasks: Vec::new(),
+            handoff_task: None,
+            handoff_listener: None,
+            handoff_binding: None,
+            project_subscription: None,
+            _subscriptions: vec![subscription],
         }
     }
 
-    fn activate_path(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
-        let task = self
-            .multi_workspace
-            .update(cx, |multi_workspace, cx| {
-                multi_workspace.find_or_create_local_workspace(
-                    PathList::new(&[path.to_path_buf()]),
-                    None,
-                    None,
-                    OpenMode::Activate,
-                    None,
-                    window,
-                    cx,
-                )
-            })
-            .log_err();
-        let Some(task) = task else {
+    fn listen_for_terminal_handoffs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(unix)]
+        {
+            match terminal::timber_handoff::WindowBridge::open() {
+                Ok(bridge) => {
+                    match std::env::current_exe() {
+                        Ok(command) => {
+                            self.handoff_binding = Some(HandoffBinding {
+                                command,
+                                socket: bridge.endpoint(),
+                                project_ids_by_workspace: HashMap::new(),
+                            });
+                            self.sync_handoff_projects(cx);
+                        }
+                        Err(error) => {
+                            self.error = Some(
+                                format!("Cannot locate Timber IDE executable: {error:#}").into(),
+                            );
+                        }
+                    }
+                    self._subscriptions
+                        .push(cx.on_release(|this, cx| this.release_handoff_binding(cx)));
+                    self.handoff_listener = Some(cx.spawn_in(window, async move |this, cx| {
+                        loop {
+                            match bridge.receive().await {
+                                Ok(handoff) => {
+                                    this.update_in(cx, |this, window, cx| {
+                                        this.open_from_terminal(
+                                            handoff.path,
+                                            handoff.terminal,
+                                            window,
+                                            cx,
+                                        )
+                                    })
+                                    .log_err();
+                                }
+                                Err(error) => {
+                                    this.update(cx, |this, cx| {
+                                        this.error = Some(
+                                            format!("Timber terminal handoff failed: {error:#}")
+                                                .into(),
+                                        );
+                                        cx.notify();
+                                    })
+                                    .log_err();
+                                    break;
+                                }
+                            }
+                        }
+                    }));
+                }
+                Err(error) => {
+                    self.error =
+                        Some(format!("Cannot enable Timber terminal handoff: {error:#}").into())
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _window = window;
+            let _cx = cx;
+        }
+    }
+
+    fn sync_handoff_projects(&mut self, cx: &mut App) {
+        let Some(binding) = self.handoff_binding.as_ref() else {
             return;
         };
-        let weak_self = cx.weak_entity();
-        cx.spawn(async move |_, cx| {
-            let error = task.await.err().map(|error| error.to_string());
-            weak_self
-                .update(cx, |this, cx| {
-                    this.error = error.map(Into::into);
-                    cx.notify();
+        let command = binding.command.clone();
+        let socket = binding.socket.clone();
+        let Ok(current) = self.multi_workspace.read_with(cx, |multi_workspace, cx| {
+            multi_workspace
+                .workspaces()
+                .map(|workspace| {
+                    (
+                        workspace.entity_id(),
+                        workspace.read(cx).project().entity_id().as_u64(),
+                    )
                 })
-                .log_err();
+                .collect::<HashMap<_, _>>()
+        }) else {
+            return;
+        };
+        let Some(binding) = self.handoff_binding.as_mut() else {
+            return;
+        };
+        let mut unbound = Vec::new();
+        binding
+            .project_ids_by_workspace
+            .retain(|workspace_id, project_id| {
+                if current.get(workspace_id) == Some(project_id) {
+                    true
+                } else {
+                    unbound.push(*project_id);
+                    false
+                }
+            });
+        let mut bound = Vec::new();
+        for (workspace_id, project_id) in current {
+            if binding
+                .project_ids_by_workspace
+                .insert(workspace_id, project_id)
+                .is_none()
+            {
+                bound.push(project_id);
+            }
+        }
+        for project_id in unbound {
+            terminal::timber_handoff::unbind_project(project_id, cx);
+        }
+        for project_id in bound {
+            terminal::timber_handoff::bind_project(project_id, command.clone(), socket.clone(), cx);
+        }
+    }
+
+    fn queue_agent_terminal(
+        workspace: Entity<Workspace>,
+        cwd: PathBuf,
+        command: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn_in(window, async move |sidebar, cx| {
+            if !open_agent_terminal(workspace, cwd, command, cx).await {
+                report_missing_agent_terminal(&sidebar, cx);
+            }
         })
         .detach();
     }
+
+    fn release_handoff_binding(&mut self, cx: &mut App) {
+        if let Some(binding) = self.handoff_binding.take() {
+            for project_id in binding.project_ids_by_workspace.into_values() {
+                terminal::timber_handoff::unbind_project(project_id, cx);
+            }
+        }
+    }
+
+    fn open_from_terminal(
+        &mut self,
+        path: PathBuf,
+        terminal_command: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.invalidate();
+        self.refresh_task = None;
+        self.handoff_task = None;
+        self.loading = true;
+        self.error = None;
+        let generation = self.generation.get();
+        let activation_generation = self.activation_generation.get();
+        let loader = self.loader.clone();
+        let task = cx.background_spawn({
+            let path = path.clone();
+            async move { loader(path).await }
+        });
+        self.handoff_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            this.update_in(cx, |this, window, cx| {
+                if this.generation.get() != generation
+                    || this.activation_generation.get() != activation_generation
+                {
+                    return;
+                }
+                this.loading = false;
+                match result.and_then(|inventory| {
+                    let tree = inventory
+                        .worktrees
+                        .iter()
+                        .find(|tree| tree.path == path)
+                        .cloned()
+                        .context("Timber selected a path absent from the verified inventory")?;
+                    Ok((inventory, tree))
+                }) {
+                    Ok((inventory, tree)) => {
+                        this.cwd = Some(path);
+                        this.selected_common_git_dir =
+                            Some(inventory.repository.common_git_dir.clone());
+                        this.inventory = Some(inventory);
+                        this.activate_worktree(tree, Some(terminal_command), window, cx);
+                    }
+                    Err(error) => {
+                        this.error =
+                            Some(format!("Timber worktree handoff failed: {error:#}").into())
+                    }
+                }
+                cx.notify();
+            })
+            .log_err();
+        }));
+        cx.notify();
+    }
+
+    fn cancel_pending_handoff(&mut self) {
+        if self.loading
+            && self
+                .handoff_task
+                .as_ref()
+                .is_some_and(|task| !task.is_ready())
+        {
+            self.handoff_task = None;
+            self.loading = self
+                .refresh_task
+                .as_ref()
+                .is_some_and(|task| !task.is_ready());
+        }
+    }
+
+    fn schedule_sync(cx: &mut Context<Self>) {
+        let sidebar = cx.weak_entity();
+        cx.defer(move |cx| {
+            sidebar
+                .update(cx, |sidebar, cx| sidebar.sync_repository(cx))
+                .log_err();
+        });
+    }
+
+    fn invalidate(&mut self) {
+        self.generation.set(self.generation.get().wrapping_add(1));
+        self.activation_generation
+            .set(self.activation_generation.get().wrapping_add(1));
+    }
+
+    fn sync_repository(&mut self, cx: &mut Context<Self>) {
+        let selection = self.multi_workspace.read_with(cx, |multi_workspace, cx| {
+            let workspace = multi_workspace.workspace().clone();
+            let project = workspace.read(cx).project().clone();
+            let cwd = project
+                .read(cx)
+                .is_local()
+                .then(|| {
+                    workspace
+                        .read(cx)
+                        .root_paths(cx)
+                        .first()
+                        .map(|path| path.to_path_buf())
+                })
+                .flatten();
+            (workspace, project, cwd)
+        });
+        let Ok((workspace, project, cwd)) = selection else {
+            return;
+        };
+        self.project_subscription = Some(cx.subscribe(&project, |this, _, event, cx| {
+            if matches!(
+                event,
+                project::Event::WorktreeAdded(_)
+                    | project::Event::WorktreeRemoved(_)
+                    | project::Event::WorktreeOrderChanged
+                    | project::Event::WorktreePathsChanged { .. }
+            ) {
+                this.activation_generation
+                    .set(this.activation_generation.get().wrapping_add(1));
+                this.cancel_pending_handoff();
+                Self::schedule_sync(cx);
+            }
+        }));
+        self.forget_changed_workspaces(cx);
+        let same_repository = self.inventory.as_ref().is_some_and(|inventory| {
+            self.retained
+                .get(&workspace.entity_id())
+                .is_some_and(|retained| {
+                    retained.common_git_dir == inventory.repository.common_git_dir
+                })
+                || cwd.as_ref().is_some_and(|cwd| {
+                    inventory
+                        .worktrees
+                        .iter()
+                        .any(|tree| tree.path == *cwd || tree.canonical_path.as_ref() == Some(cwd))
+                })
+        });
+        if self.cwd == cwd || same_repository {
+            cx.notify();
+            return;
+        }
+        self.invalidate();
+        self.refresh_task = None;
+        self.inventory = None;
+        self.selected_common_git_dir = self
+            .retained
+            .get(&workspace.entity_id())
+            .map(|retained| retained.common_git_dir.clone());
+        self.cwd = cwd;
+        self.error = None;
+        self.loading = false;
+        if self.cwd.is_some() {
+            self.refresh(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.invalidate();
+        self.refresh_task = None;
+        let Some(cwd) = self.cwd.clone() else {
+            return;
+        };
+        let generation = self.generation.get();
+        let loader = self.loader.clone();
+        self.loading = true;
+        self.error = None;
+        let task = cx.background_spawn({
+            let cwd = cwd.clone();
+            async move { loader(cwd).await }
+        });
+        self.refresh_task = Some(cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.apply_inventory(generation, &cwd, result, cx)
+            })
+            .log_err();
+        }));
+        cx.notify();
+    }
+
+    fn apply_inventory(
+        &mut self,
+        generation: u64,
+        cwd: &Path,
+        result: Result<Inventory>,
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.generation.get() || self.cwd.as_deref() != Some(cwd) {
+            return;
+        }
+        self.loading = false;
+        match result {
+            Ok(inventory) => {
+                if self
+                    .selected_common_git_dir
+                    .as_ref()
+                    .is_some_and(|expected| expected != &inventory.repository.common_git_dir)
+                {
+                    self.error = Some("Repository identity changed since opening; retained editors remain available.".into());
+                    cx.notify();
+                    return;
+                }
+                self.selected_common_git_dir = Some(inventory.repository.common_git_dir.clone());
+                if let Some(tree) = inventory.worktrees.iter().find(|tree| {
+                    tree.path == inventory.repository.current_worktree_root
+                        && tree.canonical_path.is_some()
+                        && (tree.path == cwd || tree.canonical_path.as_deref() == Some(cwd))
+                }) && let Ok(workspace) = self
+                    .multi_workspace
+                    .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+                    && workspace.read(cx).root_paths(cx).len() == 1
+                {
+                    self.forget_changed_workspaces(cx);
+                    self.retained
+                        .entry(workspace.entity_id())
+                        .or_insert_with(|| RetainedWorktree {
+                            roots: PathList::new(&workspace.read(cx).root_paths(cx)),
+                            workspace: workspace.downgrade(),
+                            common_git_dir: inventory.repository.common_git_dir.clone(),
+                            tree: tree.clone(),
+                        });
+                }
+                self.inventory = Some(inventory);
+                self.error = None;
+            }
+            Err(error) => self.error = Some(format!("{error:#}").into()),
+        }
+        self.retained
+            .retain(|_, retained| retained.workspace.upgrade().is_some());
+        cx.notify();
+    }
+
+    fn forget_changed_workspaces(&mut self, cx: &App) {
+        self.retained.retain(|_, retained| {
+            retained.workspace.upgrade().is_some_and(|workspace| {
+                PathList::new(&workspace.read(cx).root_paths(cx)) == retained.roots
+            })
+        });
+    }
+
+    fn recovery_rows(&self) -> Vec<(EntityId, WeakEntity<Workspace>, PathBuf)> {
+        self.retained
+            .iter()
+            .filter(|(_, retained)| {
+                self.cwd.is_some()
+                    && self.selected_common_git_dir.as_ref() == Some(&retained.common_git_dir)
+                    && retained.workspace.upgrade().is_some()
+                    && !self.inventory.as_ref().is_some_and(|inventory| {
+                        inventory.worktrees.iter().any(|tree| {
+                            tree.canonical_path.is_some()
+                                && tree.canonical_path == retained.tree.canonical_path
+                        })
+                    })
+            })
+            .map(|(id, retained)| (*id, retained.workspace.clone(), retained.tree.path.clone()))
+            .collect()
+    }
+
+    fn activate_retained(
+        &mut self,
+        workspace: WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cancel_pending_handoff();
+        self.activation_generation
+            .set(self.activation_generation.get().wrapping_add(1));
+        self.forget_changed_workspaces(cx);
+        let result = self
+            .retained
+            .get(&workspace.entity_id())
+            .context("Retained workspace roots changed; refresh before selecting it")
+            .and_then(|retained| {
+                anyhow::ensure!(
+                    self.selected_common_git_dir.as_ref() == Some(&retained.common_git_dir),
+                    "Retained workspace belongs to another repository"
+                );
+                workspace
+                    .upgrade()
+                    .context("Retained workspace is no longer available")
+            })
+            .and_then(|workspace| {
+                self.multi_workspace.update(cx, |multi_workspace, cx| {
+                    multi_workspace.retain_active_workspace(cx);
+                    multi_workspace.activate(workspace, None, window, cx);
+                    multi_workspace.retain_active_workspace(cx);
+                })
+            });
+        self.error = result.err().map(|error| format!("{error:#}").into());
+        cx.notify();
+    }
+
+    fn activate_worktree(
+        &mut self,
+        tree: WorktreeRecord,
+        terminal_command: Option<Vec<String>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cancel_pending_handoff();
+        self.activation_generation
+            .set(self.activation_generation.get().wrapping_add(1));
+        self.forget_changed_workspaces(cx);
+        let Some(inventory) = self.inventory.as_ref() else {
+            return;
+        };
+        let common_git_dir = inventory.repository.common_git_dir.clone();
+        if let Some(workspace) = self
+            .retained
+            .values()
+            .find(|retained| {
+                retained.common_git_dir == common_git_dir
+                    && retained.tree.canonical_path.is_some()
+                    && retained.tree.canonical_path == tree.canonical_path
+            })
+            .map(|retained| retained.workspace.clone())
+        {
+            self.activate_retained(workspace.clone(), window, cx);
+            if let Some(command) = terminal_command
+                .clone()
+                .filter(|command| !command.is_empty())
+                && let Some(workspace) = workspace.upgrade()
+            {
+                Self::queue_agent_terminal(workspace, tree.path.clone(), command, window, cx);
+            }
+            return;
+        }
+        let Some(canonical_path) = tree.canonical_path.clone().filter(|_| tree.path_exists) else {
+            self.error = Some("This worktree cannot be verified. Refresh or select its retained editor to recover unsaved work.".into());
+            cx.notify();
+            return;
+        };
+        self.activation_generation
+            .set(self.activation_generation.get().wrapping_add(1));
+        let generation = self.activation_generation.get();
+        let activation_generation = self.activation_generation.clone();
+        let guard: Rc<dyn Fn() -> bool> =
+            Rc::new(move || activation_generation.get() == generation);
+        let verifier = self.verifier.clone();
+        let verification = cx.background_spawn({
+            let verifier = verifier.clone();
+            let path = tree.path.clone();
+            let common_git_dir = common_git_dir.clone();
+            let canonical_path = canonical_path.clone();
+            async move { verifier(path, common_git_dir, canonical_path).await }
+        });
+        self.error = None;
+        self.activation_tasks.retain(|task| !task.is_ready());
+        self.activation_tasks
+            .push(cx.spawn_in(window, async move |this, cx| {
+                let result = async {
+                    verification.await?;
+                    anyhow::ensure!(guard(), "Worktree selection changed");
+                    let validator: workspace::LocalWorkspacePathValidator = Arc::new({
+                        let verifier = verifier.clone();
+                        let path = tree.path.clone();
+                        let common_git_dir = common_git_dir.clone();
+                        let canonical_path = canonical_path.clone();
+                        move |opened_paths| {
+                            let verifier = verifier.clone();
+                            let path = path.clone();
+                            let common_git_dir = common_git_dir.clone();
+                            let canonical_path = canonical_path.clone();
+                            async move {
+                                anyhow::ensure!(
+                                    opened_paths == vec![canonical_path.clone()],
+                                    "Opened roots differ from the verified worktree"
+                                );
+                                verifier(path, common_git_dir, canonical_path).await
+                            }
+                            .boxed()
+                        }
+                    });
+                    let sidebar = this.clone();
+                    let init_tree = tree.clone();
+                    let init_common_git_dir = common_git_dir.clone();
+                    let task = this.update_in(cx, |this, window, cx| {
+                        this.multi_workspace.update(cx, |multi_workspace, cx| {
+                            multi_workspace.retain_active_workspace(cx);
+                            multi_workspace.find_or_create_local_workspace_guarded(
+                                PathList::new(&[tree.path.clone()]),
+                                None,
+                                Some(Box::new(move |workspace, _, cx| {
+                                    let roots = PathList::new(&workspace.root_paths(cx));
+                                    let workspace = cx.entity().downgrade();
+                                    sidebar
+                                        .update(cx, |this, cx| {
+                                            this.retained.insert(
+                                                workspace.entity_id(),
+                                                RetainedWorktree {
+                                                    workspace,
+                                                    roots,
+                                                    common_git_dir: init_common_git_dir,
+                                                    tree: init_tree,
+                                                },
+                                            );
+                                            cx.notify();
+                                        })
+                                        .log_err();
+                                })),
+                                OpenMode::Activate,
+                                None,
+                                workspace::LocalWorkspaceOpenGuard {
+                                    is_current: guard.clone(),
+                                    validate_paths: Some(validator),
+                                },
+                                window,
+                                cx,
+                            )
+                        })
+                    })??;
+                    let workspace = task.await?;
+                    if let Some(command) = terminal_command.filter(|command| !command.is_empty()) {
+                        let cwd = tree.path.clone();
+                        let workspace = workspace.clone();
+                        let sidebar = this.clone();
+                        cx.spawn(async move |cx| {
+                            if !open_agent_terminal(workspace, cwd, command, cx).await {
+                                report_missing_agent_terminal(&sidebar, cx);
+                            }
+                        })
+                        .detach();
+                    }
+                    this.update(cx, |this, cx| {
+                        let roots = PathList::new(&workspace.read(cx).root_paths(cx));
+                        if roots.paths().len() == 1
+                            && roots.paths().first().is_some_and(|root| {
+                                root.as_path() == canonical_path.as_path()
+                                    || root.as_path() == tree.path.as_path()
+                            })
+                        {
+                            this.retained
+                                .entry(workspace.entity_id())
+                                .or_insert_with(|| RetainedWorktree {
+                                    workspace: workspace.downgrade(),
+                                    roots,
+                                    common_git_dir,
+                                    tree,
+                                });
+                            cx.notify();
+                        }
+                    })?;
+                    Ok::<_, anyhow::Error>(())
+                }
+                .await;
+                this.update(cx, |this, cx| {
+                    if this.activation_generation.get() == generation {
+                        this.error = result.err().map(|error| format!("{error:#}").into());
+                        cx.notify();
+                    }
+                })
+                .log_err();
+            }));
+    }
+}
+
+fn report_missing_agent_terminal(
+    sidebar: &WeakEntity<TimberSidebar>,
+    cx: &mut gpui::AsyncWindowContext,
+) {
+    sidebar
+        .update(cx, |sidebar, cx| {
+            sidebar.error =
+                Some("Opened the worktree, but its terminal was not ready for the agent.".into());
+            cx.notify();
+        })
+        .log_err();
+}
+
+async fn open_agent_terminal(
+    workspace: Entity<Workspace>,
+    cwd: PathBuf,
+    mut command: Vec<String>,
+    cx: &mut gpui::AsyncWindowContext,
+) -> bool {
+    let Some(program) = command.first().cloned() else {
+        return true;
+    };
+    let args = command.split_off(1);
+    let command_label = std::iter::once(program.as_str())
+        .chain(args.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ");
+    for _attempt in 0..100 {
+        let ready = workspace.update(cx, |workspace, _| workspace.has_terminal_provider());
+        if !ready {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(100))
+                .await;
+            continue;
+        }
+        return workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace
+                    .spawn_in_terminal(
+                        task::SpawnInTerminal {
+                            id: task::TaskId(format!("timber-agent-{command_label}-{cwd:?}")),
+                            full_label: command_label.clone(),
+                            label: program.clone(),
+                            command: Some(program.clone()),
+                            args: args.clone(),
+                            command_label: command_label.clone(),
+                            cwd: Some(cwd.clone()),
+                            env: HashMap::default(),
+                            use_new_terminal: true,
+                            allow_concurrent_runs: true,
+                            reveal: task::RevealStrategy::Always,
+                            reveal_target: task::RevealTarget::Dock,
+                            hide: task::HideStrategy::Never,
+                            shell: task::Shell::System,
+                            show_summary: false,
+                            show_command: true,
+                            show_rerun: false,
+                            save: task::SaveStrategy::None,
+                        },
+                        window,
+                        cx,
+                    )
+                    .detach();
+            })
+            .is_ok();
+    }
+    false
 }
 
 impl Focusable for TimberSidebar {
@@ -72,13 +804,19 @@ impl Focusable for TimberSidebar {
 
 impl Render for TimberSidebar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let active_paths = self
+        self.forget_changed_workspaces(cx);
+        let active_workspace = self
             .multi_workspace
-            .read_with(cx, |multi_workspace, cx| {
-                multi_workspace.workspace().read(cx).root_paths(cx)
+            .read_with(cx, |multi_workspace, _| {
+                multi_workspace.workspace().entity_id()
             })
-            .log_err()
+            .ok();
+        let rows = self
+            .inventory
+            .as_ref()
+            .map(|inventory| inventory.worktrees.clone())
             .unwrap_or_default();
+        let retained_rows = self.recovery_rows();
         div()
             .track_focus(&self.focus_handle)
             .flex()
@@ -91,32 +829,102 @@ impl Render for TimberSidebar {
                     .px_3()
                     .flex()
                     .items_center()
+                    .justify_between()
                     .text_xs()
-                    .child("WORKTREES"),
+                    .child("WORKTREES")
+                    .child(
+                        Button::new(
+                            "timber-refresh",
+                            if self.loading {
+                                "Refreshing…"
+                            } else {
+                                "Refresh"
+                            },
+                        )
+                        .disabled(self.cwd.is_none())
+                        .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                    ),
             )
+            .when_some(self.cwd.clone(), |this, cwd| {
+                this.child(div().px_3().py_1().text_xs().child(format!(
+                    "Repository from {}",
+                    display_text(&cwd.display().to_string())
+                )))
+            })
             .when_some(self.error.clone(), |this, error| {
                 this.child(div().px_3().py_2().text_sm().child(error))
             })
-            .children(self.worktree_paths.iter().map(|path| {
-                let is_active = active_paths
-                    .iter()
-                    .any(|active_path| active_path.as_ref() == path.as_path());
-                let label: SharedString = path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.display().to_string())
-                    .into();
-                let accessible_label = path.display().to_string();
-                let path = path.clone();
-                Button::new(accessible_label.clone(), label)
-                    .aria_label(accessible_label)
-                    .tab_index(0_isize)
-                    .toggle_state(is_active)
-                    .selected_style(ui::ButtonStyle::Tinted(ui::TintColor::Accent))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.activate_path(&path, window, cx);
+            .when(self.cwd.is_none(), |this| {
+                this.child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .text_sm()
+                        .child("Open a local repository to list worktrees."),
+                )
+            })
+            .child(
+                div()
+                    .id("timber-worktree-list")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .children(rows.into_iter().enumerate().map(|(index, tree)| {
+                        let label: SharedString =
+                            display_text(tree.branch.as_deref().unwrap_or("Detached HEAD")).into();
+                        let path = display_text(&tree.path.display().to_string());
+                        let summary = tree.summary();
+                        let selected = self.retained.iter().any(|(id, retained)| {
+                            Some(*id) == active_workspace
+                                && retained.tree.canonical_path.is_some()
+                                && retained.tree.canonical_path == tree.canonical_path
+                        });
+                        div()
+                            .px_3()
+                            .py_2()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                Button::new(("timber-worktree", index), label)
+                                    .aria_label(path.clone())
+                                    .full_width()
+                                    .tab_index(0_isize)
+                                    .toggle_state(selected)
+                                    .selected_style(ui::ButtonStyle::Tinted(ui::TintColor::Accent))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.activate_worktree(tree.clone(), None, window, cx)
+                                    })),
+                            )
+                            .child(div().text_xs().child(summary))
+                            .child(div().text_xs().child(path))
                     }))
-            }))
+                    .children(retained_rows.into_iter().map(|(id, workspace, path)| {
+                        div()
+                            .px_3()
+                            .py_2()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                Button::new(
+                                    ("timber-retained", id),
+                                    "Retained editor (unavailable)",
+                                )
+                                .toggle_state(Some(id) == active_workspace)
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        this.activate_retained(workspace.clone(), window, cx)
+                                    },
+                                )),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .child(display_text(&path.display().to_string())),
+                            )
+                    })),
+            )
     }
 }
 
@@ -124,20 +932,16 @@ impl WorkspaceSidebar for TimberSidebar {
     fn width(&self, _cx: &App) -> Pixels {
         self.width
     }
-
     fn set_width(&mut self, width: Option<Pixels>, cx: &mut Context<Self>) {
         self.width = width.unwrap_or(px(240.)).clamp(px(180.), px(500.));
         cx.notify();
     }
-
     fn has_notifications(&self, _cx: &App) -> bool {
         false
     }
-
     fn is_threads_list_view_active(&self) -> bool {
         false
     }
-
     fn side(&self, _cx: &App) -> SidebarSide {
         SidebarSide::Left
     }
@@ -152,6 +956,29 @@ mod tests {
     use gpui::TestAppContext;
     use project::{DisableAiSettings, Project};
     use settings::{Settings, SettingsStore};
+
+    fn tree(path: &str) -> WorktreeRecord {
+        serde_json::from_value(serde_json::json!({
+            "path": path, "canonicalPath": path, "branch": "feature", "head": null,
+            "isPrimary": false, "detached": false, "pathExists": true,
+            "locked": null, "prunable": null,
+            "status": {"kind": "known", "modified": [], "untracked": [], "ignored": []}
+        }))
+        .expect("complete worktree fixture")
+    }
+
+    fn remember(sidebar: &mut TimberSidebar, workspace: &Entity<Workspace>, path: &str, cx: &App) {
+        sidebar.selected_common_git_dir = Some("/repo/.git".into());
+        sidebar.retained.insert(
+            workspace.entity_id(),
+            RetainedWorktree {
+                roots: PathList::new(&workspace.read(cx).root_paths(cx)),
+                workspace: workspace.downgrade(),
+                common_git_dir: "/repo/.git".into(),
+                tree: tree(path),
+            },
+        );
+    }
 
     #[gpui::test]
     async fn test_selector_activates_retained_workspaces_in_current_window(
@@ -179,11 +1006,21 @@ mod tests {
         let workspace_b = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
             multi_workspace.test_add_workspace(project_b, window, cx)
         });
-        let sidebar = cx.new(|cx| TimberSidebar::new(multi_workspace.clone(), cx));
+        let sidebar = cx.new(|cx| {
+            TimberSidebar::with_loader(
+                multi_workspace.clone(),
+                Arc::new(|_| futures::future::pending().boxed()),
+                cx,
+            )
+        });
 
-        for (path, expected_workspace) in [("/root_a", workspace_a), ("/root_b", workspace_b)] {
+        sidebar.update(cx, |sidebar, cx| {
+            remember(sidebar, &workspace_a, "/root_a", cx);
+            remember(sidebar, &workspace_b, "/root_b", cx);
+        });
+        for expected_workspace in [workspace_a, workspace_b] {
             sidebar.update_in(cx, |sidebar, window, cx| {
-                sidebar.activate_path(Path::new(path), window, cx);
+                sidebar.activate_retained(expected_workspace.downgrade(), window, cx);
             });
             cx.run_until_parked();
             multi_workspace.read_with(cx, |multi_workspace, _| {
@@ -192,5 +1029,366 @@ mod tests {
             });
             sidebar.read_with(cx, |sidebar, _| assert!(sidebar.error.is_none()));
         }
+    }
+    #[gpui::test]
+    async fn refresh_preserves_good_inventory_and_rejects_stale_results(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            DisableAiSettings::register(cx);
+        });
+        let filesystem = FakeFs::new(cx.executor());
+        filesystem
+            .insert_tree("/repo", serde_json::json!({"file.txt": "A"}))
+            .await;
+        let project = Project::test(filesystem, [Path::new("/repo")], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let (sender, receiver) = async_channel::unbounded();
+        let sidebar = cx.new(|cx| {
+            TimberSidebar::with_loader(
+                multi_workspace.clone(),
+                Arc::new(move |_| {
+                    let receiver = receiver.clone();
+                    async move { receiver.recv().await.expect("test inventory") }.boxed()
+                }),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let inventory = Inventory {
+            repository: crate::timber_cli::RepositoryIdentity {
+                common_git_dir: "/repo/.git".into(),
+                primary_worktree_root: "/repo".into(),
+                current_worktree_root: "/repo".into(),
+            },
+            worktrees: Vec::new(),
+        };
+        sender.send(Ok(inventory)).await.expect("send inventory");
+        cx.run_until_parked();
+        multi_workspace.read_with(cx, |multi_workspace, _| {
+            assert_eq!(multi_workspace.workspaces().count(), 1)
+        });
+        sidebar.update(cx, |sidebar, cx| sidebar.refresh(cx));
+        sender
+            .send(Err(anyhow::anyhow!("listing failed")))
+            .await
+            .expect("send failure");
+        cx.run_until_parked();
+        sidebar.read_with(cx, |sidebar, _| {
+            assert!(sidebar.inventory.is_some());
+            assert!(
+                sidebar
+                    .error
+                    .as_ref()
+                    .is_some_and(|error| error.contains("listing failed"))
+            );
+        });
+        sidebar.update(cx, |sidebar, cx| {
+            let generation = sidebar.generation.get();
+            sidebar.generation.set(generation + 1);
+            sidebar.apply_inventory(
+                generation,
+                Path::new("/repo"),
+                Err(anyhow::anyhow!("stale error")),
+                cx,
+            );
+            assert!(
+                !sidebar
+                    .error
+                    .as_ref()
+                    .is_some_and(|error| error.contains("stale error"))
+            );
+        });
+    }
+    #[gpui::test]
+    async fn retained_recovery_is_scoped_and_keeps_unsaved_items(cx: &mut TestAppContext) {
+        use fs::Fs as _;
+        use workspace::item::test::TestItem;
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            DisableAiSettings::register(cx);
+        });
+        let filesystem = FakeFs::new(cx.executor());
+        filesystem
+            .insert_tree("/root_a", serde_json::json!({"file.txt": "A"}))
+            .await;
+        filesystem
+            .insert_tree("/root_b", serde_json::json!({"file.txt": "B"}))
+            .await;
+        let project_a = Project::test(filesystem.clone(), [Path::new("/root_a")], cx).await;
+        let project_b = Project::test(filesystem.clone(), [Path::new("/root_b")], cx).await;
+        let (multi_workspace, cx) = cx
+            .add_window_view(|window, cx| MultiWorkspace::test_new(project_a.clone(), window, cx));
+        let workspace_a =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        let workspace_b = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+            multi_workspace.test_add_workspace(project_b, window, cx)
+        });
+        let item = cx.new(|cx| {
+            let mut item = TestItem::new(cx).with_dirty(true);
+            item.state = "unsaved edits".into();
+            item
+        });
+        workspace_b.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(item.clone()), None, true, window, cx)
+        });
+        let sidebar = cx.new(|cx| {
+            TimberSidebar::with_loader(
+                multi_workspace.clone(),
+                Arc::new(|_| futures::future::pending().boxed()),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        sidebar.update(cx, |sidebar, cx| {
+            remember(sidebar, &workspace_a, "/root_a", cx);
+            remember(sidebar, &workspace_b, "/root_b", cx);
+            sidebar.inventory = None;
+            sidebar.cwd = Some("/unseen_repo".into());
+            sidebar.selected_common_git_dir = None;
+            assert!(
+                sidebar.recovery_rows().is_empty(),
+                "unseen repository must not expose previous rows"
+            );
+            sidebar.cwd = Some("/root_a".into());
+            sidebar.selected_common_git_dir = Some("/repo/.git".into());
+            assert_eq!(sidebar.recovery_rows().len(), 2);
+        });
+        filesystem
+            .remove_dir(
+                Path::new("/root_b"),
+                fs::RemoveOptions {
+                    recursive: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("remove worktree externally");
+        cx.run_until_parked();
+        sidebar.update_in(cx, |sidebar, window, cx| {
+            sidebar.activate_retained(workspace_b.downgrade(), window, cx)
+        });
+        multi_workspace.read_with(cx, |multi_workspace, _| {
+            assert_eq!(multi_workspace.workspace(), &workspace_b)
+        });
+        workspace_b.read_with(cx, |workspace, cx| {
+            assert!(
+                workspace
+                    .items_of_type::<TestItem>(cx)
+                    .any(|candidate| candidate == item)
+            );
+            assert_eq!(item.read(cx).state, "unsaved edits");
+            assert!(item.read(cx).is_dirty);
+        });
+        let root_id = project_a.read_with(cx, |project, cx| {
+            project
+                .visible_worktrees(cx)
+                .next()
+                .expect("root")
+                .read(cx)
+                .id()
+        });
+        project_a.update(cx, |project, cx| project.remove_worktree(root_id, cx));
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.forget_changed_workspaces(cx);
+            assert!(
+                !sidebar.retained.contains_key(&workspace_a.entity_id()),
+                "changed roots invalidate cached identity"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn rejected_selection_invalidates_pending_activation(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            DisableAiSettings::register(cx);
+        });
+        let filesystem = FakeFs::new(cx.executor());
+        filesystem
+            .insert_tree("/repo", serde_json::json!({"file.txt": "A"}))
+            .await;
+        let project = Project::test(filesystem, [Path::new("/repo")], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let sidebar = cx.new(|cx| {
+            TimberSidebar::with_loader(
+                multi_workspace,
+                Arc::new(|_| futures::future::pending().boxed()),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        sidebar.update_in(cx, |sidebar, window, cx| {
+            sidebar.inventory = Some(Inventory {
+                repository: crate::timber_cli::RepositoryIdentity {
+                    common_git_dir: "/repo/.git".into(),
+                    primary_worktree_root: "/repo".into(),
+                    current_worktree_root: "/repo".into(),
+                },
+                worktrees: vec![tree("/repo")],
+            });
+            let pending_generation = sidebar.activation_generation.get();
+            let mut missing = tree("/missing");
+            missing.canonical_path = None;
+            missing.path_exists = false;
+            sidebar.activate_worktree(missing, None, window, cx);
+            assert_ne!(pending_generation, sidebar.activation_generation.get());
+            assert!(sidebar.error.is_some());
+        });
+    }
+    #[gpui::test]
+    async fn opening_worktree_caches_recovery_before_next_listing(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            DisableAiSettings::register(cx);
+        });
+        let app_state = cx.update(workspace::AppState::test);
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree("/repo_a", serde_json::json!({"file.txt": "A"}))
+            .await;
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree("/repo_b", serde_json::json!({"file.txt": "B"}))
+            .await;
+        let project = Project::test(app_state.fs.clone(), [Path::new("/repo_a")], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let sidebar = cx.new(|cx| {
+            TimberSidebar::with_loader(
+                multi_workspace.clone(),
+                Arc::new(|path| {
+                    if path == Path::new("/repo_b") {
+                        async {
+                            Ok(Inventory {
+                                repository: crate::timber_cli::RepositoryIdentity {
+                                    common_git_dir: "/repo/.git".into(),
+                                    primary_worktree_root: "/repo_a".into(),
+                                    current_worktree_root: "/repo_b".into(),
+                                },
+                                worktrees: vec![tree("/repo_a"), tree("/repo_b")],
+                            })
+                        }
+                        .boxed()
+                    } else {
+                        futures::future::pending().boxed()
+                    }
+                }),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        sidebar.update_in(cx, |sidebar, window, cx| {
+            sidebar.verifier = Arc::new(|_, _, _| async { Ok(()) }.boxed());
+            sidebar.selected_common_git_dir = Some("/repo/.git".into());
+            sidebar.inventory = Some(Inventory {
+                repository: crate::timber_cli::RepositoryIdentity {
+                    common_git_dir: "/repo/.git".into(),
+                    primary_worktree_root: "/repo_a".into(),
+                    current_worktree_root: "/repo_a".into(),
+                },
+                worktrees: vec![tree("/repo_a"), tree("/repo_b")],
+            });
+            sidebar.open_from_terminal(PathBuf::from("/repo_b"), Vec::new(), window, cx);
+        });
+        cx.run_until_parked();
+        let workspace_b = multi_workspace.read_with(cx, |multi_workspace, cx| {
+            assert_eq!(multi_workspace.workspaces().count(), 2);
+            assert_eq!(
+                multi_workspace
+                    .workspace()
+                    .read(cx)
+                    .root_paths(cx)
+                    .first()
+                    .map(|path| path.as_ref()),
+                Some(Path::new("/repo_b"))
+            );
+            multi_workspace.workspace().clone()
+        });
+        sidebar.update(cx, |sidebar, _| {
+            assert!(sidebar.retained.contains_key(&workspace_b.entity_id()));
+            sidebar.inventory = None;
+            assert!(
+                sidebar
+                    .recovery_rows()
+                    .iter()
+                    .any(|(id, _, _)| *id == workspace_b.entity_id()),
+                "new editor remains recoverable while its first refresh is pending"
+            );
+        });
+    }
+    #[gpui::test]
+    async fn switching_listed_worktrees_does_not_reload_inventory(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            DisableAiSettings::register(cx);
+        });
+        let filesystem = FakeFs::new(cx.executor());
+        filesystem
+            .insert_tree("/repo_a", serde_json::json!({"file.txt": "A"}))
+            .await;
+        filesystem
+            .insert_tree("/repo_b", serde_json::json!({"file.txt": "B"}))
+            .await;
+        let project_a = Project::test(filesystem.clone(), [Path::new("/repo_a")], cx).await;
+        let project_b = Project::test(filesystem, [Path::new("/repo_b")], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+        let workspace_a =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        let loads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sidebar = cx.new(|cx| {
+            TimberSidebar::with_loader(
+                multi_workspace.clone(),
+                {
+                    let loads = loads.clone();
+                    Arc::new(move |_| {
+                        loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        futures::future::pending().boxed()
+                    })
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        sidebar.update(cx, |sidebar, _| {
+            sidebar.inventory = Some(Inventory {
+                repository: crate::timber_cli::RepositoryIdentity {
+                    common_git_dir: "/repo/.git".into(),
+                    primary_worktree_root: "/repo_a".into(),
+                    current_worktree_root: "/repo_a".into(),
+                },
+                worktrees: vec![tree("/repo_a"), tree("/repo_b")],
+            });
+            sidebar.selected_common_git_dir = Some("/repo/.git".into());
+            sidebar.loading = false;
+        });
+        multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+            multi_workspace.test_add_workspace(project_b, window, cx);
+        });
+        cx.run_until_parked();
+        multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+            multi_workspace.activate(workspace_a, None, window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            loads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "same-repository selection must reuse the inventory"
+        );
+        sidebar.read_with(cx, |sidebar, _| assert!(!sidebar.loading));
     }
 }
