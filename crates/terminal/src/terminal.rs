@@ -1,4 +1,5 @@
 mod mappings;
+pub mod timber_handoff;
 
 mod alacritty;
 mod pty_info;
@@ -944,6 +945,7 @@ pub enum MouseInputMode {
 enum TerminalModeKind {
     Interactive,
     InteractiveWithCompletion(Sender<Option<ExitStatus>>),
+    InteractiveWithRetainedOutput(Sender<Option<ExitStatus>>),
     Task {
         state: TaskState,
         completion_tx: Sender<Option<ExitStatus>>,
@@ -959,6 +961,13 @@ impl TerminalMode {
     /// Creates an interactive terminal that reports when its shell exits.
     pub fn interactive_with_completion(completion_tx: Sender<Option<ExitStatus>>) -> Self {
         Self(TerminalModeKind::InteractiveWithCompletion(completion_tx))
+    }
+
+    /// Retains command diagnostics so failures can be inspected after completion.
+    pub fn interactive_with_retained_output(completion_tx: Sender<Option<ExitStatus>>) -> Self {
+        Self(TerminalModeKind::InteractiveWithRetainedOutput(
+            completion_tx,
+        ))
     }
 
     /// Creates a running task terminal with an internally paired completion channel.
@@ -1030,6 +1039,7 @@ impl TerminalBuilder {
             terminal_type: TerminalType::DisplayOnly,
             subprocess: None,
             completion_tx: None,
+            retain_output_on_exit: false,
             term,
             term_config: config,
             output_processor: None,
@@ -1121,16 +1131,23 @@ impl TerminalBuilder {
             Ok(signal_mask) => Some(signal_mask),
             Err(error) => return Task::ready(Err(error)),
         };
+        let mut handoff_env = std::collections::HashMap::new();
+        // Spawn sites pass the Project entity id here, not the GPUI window id.
+        timber_handoff::insert_terminal_env(window_id, is_remote_terminal, &mut handoff_env, cx);
+        env.extend(handoff_env);
         let fut = async move {
-            let (task, completion_tx) = match mode.0 {
-                TerminalModeKind::Interactive => (None, None),
+            let (task, completion_tx, retain_output_on_exit) = match mode.0 {
+                TerminalModeKind::Interactive => (None, None, false),
                 TerminalModeKind::InteractiveWithCompletion(completion_tx) => {
-                    (None, Some(completion_tx))
+                    (None, Some(completion_tx), false)
+                }
+                TerminalModeKind::InteractiveWithRetainedOutput(completion_tx) => {
+                    (None, Some(completion_tx), true)
                 }
                 TerminalModeKind::Task {
                     state,
                     completion_tx,
-                } => (Some(state), Some(completion_tx)),
+                } => (Some(state), Some(completion_tx), false),
             };
 
             // Remove SHLVL so the spawned shell initializes it to 1, matching
@@ -1320,6 +1337,7 @@ impl TerminalBuilder {
                 terminal_type,
                 subprocess,
                 completion_tx,
+                retain_output_on_exit,
                 term,
                 term_config: config,
                 output_processor: None,
@@ -1525,6 +1543,7 @@ pub struct Terminal {
     /// subprocess and the task pumping its output into the grid.
     subprocess: Option<SubprocessHandle>,
     completion_tx: Option<Sender<Option<ExitStatus>>>,
+    retain_output_on_exit: bool,
     term: Arc<AlacrittyTermLock>,
     term_config: AlacrittyTermConfig,
     output_processor: Option<Processor<StdSyncHandler>>,
@@ -3129,6 +3148,21 @@ impl Terminal {
         }
     }
 
+    /// Allows window shutdown to stop a command without losing its exit result.
+    pub fn terminate_process(&mut self) {
+        match &self.terminal_type {
+            TerminalType::Pty { info, .. } => {
+                info.kill_current_process();
+                info.kill_child_process();
+            }
+            TerminalType::DisplayOnly => {
+                if let Some(subprocess) = &self.subprocess {
+                    subprocess.kill();
+                }
+            }
+        }
+    }
+
     /// Returns whether this terminal still owns its live PTY sender.
     pub fn has_active_pty_resources(&self) -> bool {
         matches!(
@@ -3216,6 +3250,10 @@ impl Terminal {
         let task = match &mut self.task {
             Some(task) => task,
             None => {
+                if self.retain_output_on_exit {
+                    cx.notify();
+                    return;
+                }
                 // For interactive shells (no task), we need to differentiate:
                 // 1. User-initiated exits (typed "exit", Ctrl+D, etc.) - always close,
                 //    even if the shell exits with a non-zero code (e.g. after `false`).

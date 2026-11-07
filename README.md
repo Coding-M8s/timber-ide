@@ -23,6 +23,22 @@ To build and install an optimized Linux desktop release from source:
 
 The current packaging target is the native Linux archive. Flatpak packaging is not configured for Timber.
 
+### Worktree sidebar
+
+The sidebar uses the separate Timber Git-worktree CLI for inventory, New/Open,
+and Done operations. The editor launcher is also named `timber`, so expose the
+worktree CLI as `timber-worktree` on `PATH`, or set `TIMBER_WORKTREE_CLI` to its
+executable path when launching the editor:
+
+```sh
+TIMBER_WORKTREE_CLI=/path/to/worktree-cli timber /path/to/repository
+```
+
+The backend must support `ls --json`, `new`/`open` IDE result files, and native
+`__ide-done` cleanup previews. The worktree CLI is not included in the desktop
+archive. Refresh reloads its inventory; Done opens a cleanup review before
+removing a linked worktree. The sidebar remains available with AI disabled.
+
 ### Developing Timber
 
 The upstream development documentation also applies to Timber's Zed base:

@@ -29,6 +29,15 @@ pub mod welcome;
 pub mod workspace_error;
 mod workspace_settings;
 
+pub type LocalWorkspacePathValidator =
+    Arc<dyn Fn(Vec<PathBuf>) -> futures::future::BoxFuture<'static, Result<()>> + Send + Sync>;
+
+#[derive(Clone)]
+pub struct LocalWorkspaceOpenGuard {
+    pub is_current: std::rc::Rc<dyn Fn() -> bool>,
+    pub validate_paths: Option<LocalWorkspacePathValidator>,
+}
+
 pub use dock::Panel;
 pub use multi_workspace::{
     CloseWorkspaceSidebar, DraggedSidebar, FocusWorkspaceSidebar, MoveProjectDown,
@@ -2166,6 +2175,34 @@ impl Workspace {
         open_mode: OpenMode,
         cx: &mut App,
     ) -> Task<anyhow::Result<OpenResult>> {
+        Self::new_local_guarded(
+            abs_paths,
+            app_state,
+            requesting_window,
+            env,
+            init,
+            open_mode,
+            LocalWorkspaceOpenGuard {
+                is_current: std::rc::Rc::new(|| true),
+                validate_paths: None,
+            },
+            cx,
+        )
+    }
+
+    pub(crate) fn new_local_guarded(
+        abs_paths: Vec<PathBuf>,
+        app_state: Arc<AppState>,
+        requesting_window: Option<WindowHandle<MultiWorkspace>>,
+        env: Option<HashMap<String, String>>,
+        init: Option<Box<dyn FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + Send>>,
+        open_mode: OpenMode,
+        activation_guard: LocalWorkspaceOpenGuard,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<OpenResult>> {
+        if !(activation_guard.is_current)() {
+            return Task::ready(Err(anyhow::anyhow!("Workspace selection changed")));
+        }
         let project_handle = Project::local(
             app_state.client.clone(),
             app_state.node_runtime.clone(),
@@ -2182,10 +2219,12 @@ impl Workspace {
         cx.spawn(async move |cx| {
             let mut paths_to_open = Vec::with_capacity(abs_paths.len());
             for path in abs_paths.into_iter() {
-                if let Some(canonical) = app_state.fs.canonicalize(&path).await.ok() {
-                    paths_to_open.push(canonical)
+                if activation_guard.validate_paths.is_some() {
+                    paths_to_open.push(app_state.fs.canonicalize(&path).await?);
+                } else if let Ok(canonical) = app_state.fs.canonicalize(&path).await {
+                    paths_to_open.push(canonical);
                 } else {
-                    paths_to_open.push(path)
+                    paths_to_open.push(path);
                 }
             }
 
@@ -2256,6 +2295,19 @@ impl Workspace {
                 });
             }
 
+            if let Some(validate_paths) = &activation_guard.validate_paths {
+                let opened_roots = project_handle.read_with(cx, |project, cx| {
+                    project
+                        .visible_worktrees(cx)
+                        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                        .collect()
+                });
+                validate_paths(opened_roots).await?;
+            }
+            anyhow::ensure!(
+                (activation_guard.is_current)(),
+                "Workspace selection changed"
+            );
             let window_to_replace = match open_mode {
                 OpenMode::NewWindow => None,
                 _ => requesting_window,
@@ -2269,6 +2321,10 @@ impl Workspace {
                         .unwrap_or(false);
 
                     let workspace = window.update(cx, |multi_workspace, window, cx| {
+                        anyhow::ensure!(
+                            (activation_guard.is_current)(),
+                            "Workspace selection changed"
+                        );
                         let workspace = cx.new(|cx| {
                             let mut workspace = Workspace::new(
                                 Some(workspace_id),
@@ -2298,8 +2354,8 @@ impl Workspace {
                                 unreachable!()
                             }
                         }
-                        workspace
-                    })?;
+                        Ok::<_, anyhow::Error>(workspace)
+                    })??;
                     (window, workspace)
                 } else {
                     let window_bounds_override = window_bounds_env_override();
@@ -2429,8 +2485,10 @@ impl Workspace {
 
             if open_mode == OpenMode::NewWindow || open_mode == OpenMode::Activate {
                 window
-                    .update(cx, |_, window, _cx| {
-                        window.activate_window();
+                    .update(cx, |_, window, cx| {
+                        if workspace.read(cx).owns_window_chrome() {
+                            window.activate_window();
+                        }
                     })
                     .log_err();
             }
@@ -2439,7 +2497,9 @@ impl Workspace {
             window
                 .update(cx, |_, window, cx| {
                     workspace.update(cx, |workspace, cx| {
-                        workspace.show_worktree_trust_security_modal(false, window, cx);
+                        if workspace.owns_window_chrome() {
+                            workspace.show_worktree_trust_security_modal(false, window, cx);
+                        }
                     });
                 })
                 .log_err();
@@ -3446,6 +3506,10 @@ impl Workspace {
 
     pub fn set_terminal_provider(&mut self, provider: impl TerminalProvider + 'static) {
         self.terminal_provider = Some(Box::new(provider));
+    }
+
+    pub fn has_terminal_provider(&self) -> bool {
+        self.terminal_provider.is_some()
     }
 
     pub fn set_debugger_provider(&mut self, provider: impl DebuggerProvider + 'static) {
@@ -8134,7 +8198,9 @@ impl Workspace {
 
                     if let Some(active_pane) = active_pane {
                         workspace.set_active_pane(&active_pane, window, cx);
-                        cx.focus_self(window);
+                        if workspace.owns_window_chrome() {
+                            cx.focus_self(window);
+                        }
                     } else {
                         workspace.set_active_pane(&workspace.center.first_pane(), window, cx);
                     }
