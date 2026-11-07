@@ -11,6 +11,7 @@ Build a release .tar.gz for Linux.
 
 Options:
   -h, --help        Display this help and exit.
+  --desktop-only    Build the Linux desktop app without the remote-development helper.
   --flatpak         Set ZED_BUNDLE_TYPE=flatpak so that this can be included in system info
   --require-sentry  Require Sentry credentials, CLI, and successful symbol upload (official releases).
   --skip-sentry     Skip symbol upload for local packaging; incompatible with --require-sentry.
@@ -19,6 +20,7 @@ Options:
 
 require_sentry=false
 skip_sentry=false
+desktop_only=false
 
 # Parse all arguments manually
 while [[ $# -gt 0 ]]; do
@@ -26,6 +28,10 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             help_info
             exit 0
+            ;;
+        --desktop-only)
+            desktop_only=true
+            shift
             ;;
         --flatpak)
             export ZED_BUNDLE_TYPE=flatpak
@@ -86,6 +92,7 @@ elif [[ -z "${SENTRY_AUTH_TOKEN:+set}" ]]; then
 fi
 
 export ZED_BUNDLE=true
+export ZED_UPDATE_EXPLANATION="${ZED_UPDATE_EXPLANATION:-Install a newer Timber release from Coding-M8s/timber-ide to update.}"
 
 channel=$(<crates/zed/RELEASE_CHANNEL)
 target_dir="${CARGO_TARGET_DIR:-target}"
@@ -109,7 +116,7 @@ fi
 # Generate the licenses first, so they can be baked into the binaries
 script/generate-licenses
 
-if "$rustup_installed"; then
+if "$rustup_installed" && ! "$desktop_only"; then
     rustup target add "$remote_server_triple"
 fi
 
@@ -126,25 +133,30 @@ if [[ ! "$lld_version" =~ LLD\ ([0-9]+)\. ]] || (( BASH_REMATCH[1] < 12 )); then
 fi
 
 # Build binary in release mode
-cargo --config .cargo/bundle-config.toml rustc --release --target "${target_triple}" --package zed --bin zed -- -C linker="$CC" -C llvm-args=-addrsig -C link-arg=-fuse-ld=lld -C link-arg=--ld-path="$lld" -C link-arg=-Wl,--icf=safe
+cargo --config .cargo/bundle-config.toml rustc --release --target "${target_triple}" --package zed --bin timber -- -C linker="$CC" -C llvm-args=-addrsig -C link-arg=-fuse-ld=lld -C link-arg=--ld-path="$lld" -C link-arg=-Wl,--icf=safe
 cargo --config .cargo/bundle-config.toml build --release --target "${target_triple}" --package cli
 # Build remote_server in separate invocation to prevent feature unification from other crates
 # from influencing dynamic libraries required by it.
-if [[ "$remote_server_triple" == "$musl_triple" ]]; then
-    musl_cc_var="CC_$(echo "$remote_server_triple" | tr '-' '_')"
-    export "$musl_cc_var"=musl-gcc
+if ! "$desktop_only"; then
+    if [[ "$remote_server_triple" == "$musl_triple" ]]; then
+        musl_cc_var="CC_$(echo "$remote_server_triple" | tr '-' '_')"
+        export "$musl_cc_var"=musl-gcc
+    fi
+    cargo --config .cargo/bundle-config.toml build --release --target "${remote_server_triple}" --package remote_server
 fi
-cargo --config .cargo/bundle-config.toml build --release --target "${remote_server_triple}" --package remote_server
 
 if ! "$skip_sentry"; then
+    symbol_binaries=("${target_dir}/${target_triple}/release/timber")
+    if ! "$desktop_only"; then
+        symbol_binaries+=("${target_dir}/${remote_server_triple}/release/remote_server")
+    fi
     echo "Uploading zed debug symbols to sentry..."
     # Sentry needs the full ELF for .eh_frame unwinding, not just the debug
     # companion. See https://github.com/getsentry/symbolic/issues/783.
     for attempt in 1 2 3; do
         echo "Attempting sentry upload (attempt $attempt/3)..."
         if sentry-cli debug-files upload --include-sources --wait -p zed -o zed-dev \
-            "${target_dir}/${target_triple}"/release/zed \
-            "${target_dir}/${remote_server_triple}"/release/remote_server; then
+            "${symbol_binaries[@]}"; then
             echo "Sentry upload successful on attempt $attempt"
             break
         fi
@@ -162,15 +174,17 @@ fi
 # is skipped.
 # We use llvm-objcopy because GNU objcopy on older distros (e.g. Ubuntu 20.04)
 # doesn't understand CREL sections produced by newer LLVM.
-llvm-objcopy --only-keep-debug "${target_dir}/${target_triple}/release/zed" "${target_dir}/${target_triple}/release/zed.dbg"
-llvm-objcopy --only-keep-debug "${target_dir}/${remote_server_triple}/release/remote_server" "${target_dir}/${remote_server_triple}/release/remote_server.dbg"
+llvm-objcopy --only-keep-debug "${target_dir}/${target_triple}/release/timber" "${target_dir}/${target_triple}/release/timber.dbg"
+if ! "$desktop_only"; then
+    llvm-objcopy --only-keep-debug "${target_dir}/${remote_server_triple}/release/remote_server" "${target_dir}/${remote_server_triple}/release/remote_server.dbg"
 
-# Ensure that remote_server does not depend on libssl nor libcrypto, as we got rid of these deps.
-if ldd "${target_dir}/${remote_server_triple}/release/remote_server" | grep -q 'libcrypto\|libssl'; then
-    if [[ "$remote_server_triple" == *-musl ]]; then
-        echo "Error: remote_server still depends on libssl or libcrypto" && exit 1
-    else
-        echo "Info: Using non-musl remote-server build."
+    # Ensure that remote_server does not depend on libssl nor libcrypto, as we got rid of these deps.
+    if ldd "${target_dir}/${remote_server_triple}/release/remote_server" | grep -q 'libcrypto\|libssl'; then
+        if [[ "$remote_server_triple" == *-musl ]]; then
+            echo "Error: remote_server still depends on libssl or libcrypto" && exit 1
+        else
+            echo "Info: Using non-musl remote-server build."
+        fi
     fi
 fi
 
@@ -183,14 +197,16 @@ fi
 # into a temp directory.
 temp_dir=$(mktemp -d)
 trap 'rm -rf "$temp_dir"' EXIT
-zed_dir="${temp_dir}/zed$suffix.app"
+zed_dir="${temp_dir}/timber$suffix.app"
 
 # Cargo may reuse its outputs on the next invocation. Strip packaging copies
 # so reruns still upload full ELFs and extract complete debug companions.
 mkdir -p "${zed_dir}/bin" "${zed_dir}/libexec"
-llvm-objcopy --strip-unneeded "${target_dir}/${target_triple}/release/zed" "${zed_dir}/libexec/zed-editor"
-llvm-objcopy --strip-debug --discard-all "${target_dir}/${target_triple}/release/cli" "${zed_dir}/bin/zed"
-llvm-objcopy --strip-debug --discard-all "${target_dir}/${remote_server_triple}/release/remote_server" "${temp_dir}/remote_server"
+llvm-objcopy --strip-unneeded "${target_dir}/${target_triple}/release/timber" "${zed_dir}/libexec/timber-editor"
+llvm-objcopy --strip-debug --discard-all "${target_dir}/${target_triple}/release/cli" "${zed_dir}/bin/timber"
+if ! "$desktop_only"; then
+    llvm-objcopy --strip-debug --discard-all "${target_dir}/${remote_server_triple}/release/remote_server" "${temp_dir}/remote_server"
+fi
 
 # Libs
 # Bundle libstdc++ so older supported systems can run binaries built with our
@@ -200,7 +216,7 @@ llvm-objcopy --strip-debug --discard-all "${target_dir}/${remote_server_triple}/
 # get dlopen'd are built against the system GLib, and resolving them against an
 # older bundled copy fails with missing symbols.
 find_libs() {
-    ldd ${target_dir}/${target_triple}/release/zed |\
+    ldd ${target_dir}/${target_triple}/release/timber |\
         cut -d' ' -f3 |\
         grep -v '\<\(libc.so\|libgcc_s.so\|libm.so\|libpthread.so\|libdl.so\|libasound.so\)' |\
         grep -v '\<\(libglib-2.0.so\|libgobject-2.0.so\|libgio-2.0.so\|libgmodule-2.0.so\|libpcre.so\|libpcre2-8.so\|libmount.so\|libblkid.so\|libselinux.so\|libffi.so\|libresolv.so\|libz.so\)'
@@ -212,29 +228,30 @@ cp $(find_libs) "${zed_dir}/lib"
 
 # Icons
 mkdir -p "${zed_dir}/share/icons/hicolor/512x512/apps"
-cp "crates/zed/resources/app-icon$suffix.png" "${zed_dir}/share/icons/hicolor/512x512/apps/zed.png"
+cp "crates/zed/resources/app-icon$suffix.png" "${zed_dir}/share/icons/hicolor/512x512/apps/timber.png"
 mkdir -p "${zed_dir}/share/icons/hicolor/1024x1024/apps"
-cp "crates/zed/resources/app-icon$suffix@2x.png" "${zed_dir}/share/icons/hicolor/1024x1024/apps/zed.png"
+cp "crates/zed/resources/app-icon$suffix@2x.png" "${zed_dir}/share/icons/hicolor/1024x1024/apps/timber.png"
 
 # .desktop
 export DO_STARTUP_NOTIFY="true"
-export APP_CLI="zed"
-export APP_ICON="zed"
+export APP_CLI="timber"
+export APP_ICON="timber"
 export APP_ARGS="%U"
 if [[ "$channel" == "preview" ]]; then
-  export APP_NAME="Zed Preview"
-  APP_ID="dev.zed.Zed-Preview"
+  export APP_NAME="Timber Preview"
+  APP_ID="io.github.CodingM8s.Timber-Preview"
 elif [[ "$channel" == "nightly" ]]; then
-  export APP_NAME="Zed Nightly"
-  APP_ID="dev.zed.Zed-Nightly"
+  export APP_NAME="Timber Nightly"
+  APP_ID="io.github.CodingM8s.Timber-Nightly"
 elif [[ "$channel" == "dev" ]]; then
-  export APP_NAME="Zed Devel"
-  APP_ID="dev.zed.Zed-Dev"
+  export APP_NAME="Timber Devel"
+  APP_ID="io.github.CodingM8s.Timber-Dev"
 else
-  export APP_NAME="Zed"
-  APP_ID="dev.zed.Zed"
+  export APP_NAME="Timber"
+  APP_ID="io.github.CodingM8s.Timber"
 fi
 
+export APP_ID
 mkdir -p "${zed_dir}/share/applications"
 envsubst < "crates/zed/resources/zed.desktop.in" > "${zed_dir}/share/applications/$APP_ID.desktop"
 chmod +x "${zed_dir}/share/applications/$APP_ID.desktop"
@@ -244,11 +261,11 @@ cp "assets/licenses.md" "${zed_dir}/licenses.md"
 
 # Create archive out of everything that's in the temp directory
 arch=$(uname -m)
-archive="zed-linux-${arch}.tar.gz"
+archive="timber-linux-${arch}.tar.gz"
 
-rm -rf "${archive}"
-remove_match="zed(-[a-zA-Z0-9]+)?-linux-$(uname -m)\.tar\.gz"
-ls "${target_dir}/release" | grep -E ${remove_match} | xargs -d "\n" -I {} rm -f "${target_dir}/release/{}" || true
-tar -czvf "${target_dir}/release/$archive" -C ${temp_dir} "zed$suffix.app"
+mkdir -p "${target_dir}/release"
+tar -czvf "${target_dir}/release/$archive" -C ${temp_dir} "timber$suffix.app"
 
-gzip -f --stdout --best "${temp_dir}/remote_server" > "${target_dir}/zed-remote-server-linux-${arch}.gz"
+if ! "$desktop_only"; then
+    gzip -f --stdout --best "${temp_dir}/remote_server" > "${target_dir}/timber-remote-server-linux-${arch}.gz"
+fi

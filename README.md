@@ -1,23 +1,29 @@
 > [!IMPORTANT]
 > Remove this line to confirm you've reviewed this PR before submitting.
-# Zed
+# Timber
 
-[![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)
-[![CI](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml/badge.svg)](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml)
+Timber is a Linux IDE based on [Zed](https://github.com/zed-industries/zed), with its own application identity, launcher, user data, and icon.
 
-Welcome to Zed, a high-performance, multiplayer code editor from the creators of [Atom](https://github.com/atom/atom) and [Tree-sitter](https://github.com/tree-sitter/tree-sitter).
+### Linux installation
 
----
+Download `timber-linux-x86_64.tar.gz`, `install.sh`, and `SHA256SUMS` from the [latest Timber release](https://github.com/Coding-M8s/timber-ide/releases/latest) into the same directory, then run:
 
-### Installation
+```sh
+sha256sum --ignore-missing --check SHA256SUMS
+sh install.sh
+```
 
-On macOS, Linux, and Windows you can [download Zed directly](https://zed.dev/download) or install Zed via your local package manager ([macOS](https://zed.dev/docs/installation#macos)/[Linux](https://zed.dev/docs/linux#installing-via-a-package-manager)/[Windows](https://zed.dev/docs/windows#package-managers)).
+Open **Timber** from your application launcher or run `~/.local/bin/timber`. The installer preserves existing Timber files as backups. Timber uses separate paths from Zed, including `~/.local/timber.app`, `~/.config/timber`, and `~/.local/share/timber`.
 
-Other platforms are not yet available:
+To build and install an optimized Linux desktop release from source:
 
-- Web ([tracking discussion](https://github.com/zed-industries/zed/discussions/26195))
+```sh
+./script/install-linux
+```
 
-### Developing Zed
+### Developing Timber
+
+The upstream development documentation also applies to Timber's Zed base:
 
 - [Building Zed for macOS](./docs/src/development/macos.md)
 - [Building Zed for Linux](./docs/src/development/linux.md)

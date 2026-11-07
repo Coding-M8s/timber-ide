@@ -21,4 +21,5 @@ rustflags = [
 rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 
 [env]
+ZED_UPDATE_EXPLANATION = "Install a newer Timber release from Coding-M8s/timber-ide to update."
 MACOSX_DEPLOYMENT_TARGET = "12.0"
