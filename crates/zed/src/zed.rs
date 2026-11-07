@@ -538,8 +538,8 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         cx.defer(move |cx| {
             window_handle
                 .update(cx, |_, _window, cx| {
-                    let sidebar =
-                        cx.new(|cx| TimberSidebar::new(multi_workspace_handle.clone(), cx));
+                    let sidebar = cx
+                        .new(|cx| TimberSidebar::new(multi_workspace_handle.clone(), _window, cx));
                     multi_workspace_handle.update(cx, |multi_workspace, cx| {
                         multi_workspace.register_sidebar(sidebar, cx);
                     });
