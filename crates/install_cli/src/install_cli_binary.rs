@@ -12,7 +12,7 @@ use workspace::{Toast, Workspace};
 actions!(
     cli,
     [
-        /// Installs the Zed CLI tool to the system PATH.
+        /// Installs the Timber CLI tool to the system PATH.
         InstallCliBinary,
     ]
 );
@@ -80,7 +80,7 @@ async fn install_script(cx: &AsyncApp) -> Result<Option<PathBuf>> {
 }
 
 pub fn install_cli_binary(window: &mut Window, cx: &mut Context<Workspace>) {
-    const LINUX_PROMPT_DETAIL: &str = "If you installed Zed from our official release add ~/.local/bin to your PATH.\n\nIf you installed Zed from a different source like your package manager, then you may need to create an alias/symlink manually.\n\nDepending on your package manager, the CLI might be named zeditor, zedit, zed-editor or something else.";
+    const LINUX_PROMPT_DETAIL: &str = "The Timber installer adds ~/.local/bin/timber. Add ~/.local/bin to your PATH, or launch Timber directly with ~/.local/bin/timber.";
 
     cx.spawn_in(window, async move |workspace, cx| {
         if cfg!(any(target_os = "linux", target_os = "freebsd")) {

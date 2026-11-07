@@ -15,8 +15,8 @@ use serde::Deserialize;
 use settings::{SettingsStore, VsCodeSettingsSource};
 use std::sync::Arc;
 use ui::{
-    Divider, KeyBinding, ParentElement as _, StatefulInteractiveElement, Vector, VectorName,
-    WithScrollbar as _, prelude::*, rems_from_px,
+    Divider, KeyBinding, ParentElement as _, StatefulInteractiveElement, WithScrollbar as _,
+    prelude::*, rems_from_px,
 };
 
 pub use workspace::welcome::ShowWelcome;
@@ -347,11 +347,11 @@ impl Render for Onboarding {
                                     .child(
                                         h_flex()
                                             .gap_4()
-                                            .child(Vector::square(VectorName::ZedLogo, rems(2.5)))
+                                            .child(gpui::img("images/timber.png").size(rems(2.5)))
                                             .child(
                                                 v_flex()
                                                     .child(
-                                                        Headline::new("Welcome to Zed")
+                                                        Headline::new("Welcome to Timber")
                                                             .size(HeadlineSize::Small),
                                                     )
                                                     .child(
