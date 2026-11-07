@@ -77,7 +77,7 @@ use settings::{
     SettingsFile, SettingsStore, VIM_KEYMAP_PATH, initial_local_debug_tasks_content,
     initial_project_settings_content, initial_tasks_content, update_settings_file,
 };
-use sidebar::Sidebar;
+use sidebar::TimberSidebar;
 #[cfg(debug_assertions)]
 use workspace::workspace_error::{ErrorAction, ErrorSeverity, WorkspaceError};
 
@@ -537,9 +537,9 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
 
         cx.defer(move |cx| {
             window_handle
-                .update(cx, |_, window, cx| {
+                .update(cx, |_, _window, cx| {
                     let sidebar =
-                        cx.new(|cx| Sidebar::new(multi_workspace_handle.clone(), window, cx));
+                        cx.new(|cx| TimberSidebar::new(multi_workspace_handle.clone(), cx));
                     multi_workspace_handle.update(cx, |multi_workspace, cx| {
                         multi_workspace.register_sidebar(sidebar, cx);
                     });
@@ -1718,7 +1718,7 @@ fn open_about_window(cx: &mut App) {
     cx.open_window(
         WindowOptions {
             titlebar: Some(TitlebarOptions {
-                title: Some("About Zed".into()),
+                title: Some("About Timber".into()),
                 appears_transparent: true,
                 traffic_light_position: Some(point(px(12.), px(12.))),
             }),

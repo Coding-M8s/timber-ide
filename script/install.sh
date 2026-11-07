@@ -1,171 +1,100 @@
 #!/usr/bin/env sh
 set -eu
 
-# Downloads a tarball from https://zed.dev/releases and unpacks it
-# into ~/.local/. If you'd prefer to do this manually, instructions are at
-# https://zed.dev/docs/linux.
+if [ "$(uname -s)" != Linux ]; then
+    echo "This Timber installer supports Linux only." >&2
+    exit 1
+fi
 
-main() {
-    platform="$(uname -s)"
-    arch="$(uname -m)"
-    channel="${ZED_CHANNEL:-stable}"
-    ZED_VERSION="${ZED_VERSION:-latest}"
-    # Use TMPDIR if available (for environments with non-standard temp directories)
-    if [ -n "${TMPDIR:-}" ] && [ -d "${TMPDIR}" ]; then
-        temp="$(mktemp -d "$TMPDIR/zed-XXXXXX")"
+case "$(uname -m)" in
+    x86_64) arch=x86_64 ;;
+    aarch64|arm64) arch=aarch64 ;;
+    *) echo "Unsupported Linux architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+
+channel="${TIMBER_CHANNEL:-stable}"
+case "$channel" in
+    stable) suffix=""; app_id=io.github.CodingM8s.Timber ;;
+    dev) suffix=-dev; app_id=io.github.CodingM8s.Timber-Dev ;;
+    nightly) suffix=-nightly; app_id=io.github.CodingM8s.Timber-Nightly ;;
+    preview) suffix=-preview; app_id=io.github.CodingM8s.Timber-Preview ;;
+    *) echo "Unknown Timber release channel: $channel" >&2; exit 1 ;;
+esac
+
+install_root="${TIMBER_INSTALL_ROOT:-$HOME/.local}"
+mkdir -p "$install_root"
+install_root="$(CDPATH= cd -- "$install_root" && pwd)"
+staging_directory="$(mktemp -d "$install_root/.timber-install.XXXXXX")"
+trap 'rm -rf "$staging_directory"' EXIT HUP INT TERM
+
+archive="${TIMBER_BUNDLE_PATH:-}"
+if [ -z "$archive" ]; then
+    script_directory="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+    if [ -f "$script_directory/timber-linux-$arch.tar.gz" ]; then
+        archive="$script_directory/timber-linux-$arch.tar.gz"
     else
-        temp="$(mktemp -d "/tmp/zed-XXXXXX")"
-    fi
-
-    if [ "$platform" = "Darwin" ]; then
-        platform="macos"
-    elif [ "$platform" = "Linux" ]; then
-        platform="linux"
-    else
-        echo "Unsupported platform $platform"
-        exit 1
-    fi
-
-    case "$platform-$arch" in
-        macos-arm64* | linux-arm64* | linux-aarch64)
-            arch="aarch64"
-            ;;
-        macos-x86* | linux-x86*)
-            arch="x86_64"
-            ;;
-        *)
-            echo "Unsupported platform or architecture"
+        archive="$staging_directory/timber-linux-$arch.tar.gz"
+        download_url="https://github.com/Coding-M8s/timber-ide/releases/latest/download/timber-linux-$arch.tar.gz"
+        echo "Downloading Timber for Linux $arch..."
+        if command -v curl >/dev/null 2>&1; then
+            curl -fL "$download_url" -o "$archive"
+        elif command -v wget >/dev/null 2>&1; then
+            wget -O "$archive" "$download_url"
+        else
+            echo "Install curl or wget, or set TIMBER_BUNDLE_PATH to a downloaded archive." >&2
             exit 1
-            ;;
-    esac
-
-    if command -v curl >/dev/null 2>&1; then
-        curl () {
-            command curl -fL "$@"
-        }
-    elif command -v wget >/dev/null 2>&1; then
-        curl () {
-            wget -O- "$@"
-        }
-    else
-        echo "Could not find 'curl' or 'wget' in your path"
-        exit 1
-    fi
-
-    "$platform" "$@"
-
-    if [ "$(command -v zed)" = "$HOME/.local/bin/zed" ]; then
-        echo "Zed has been installed. Run with 'zed'"
-    else
-        echo "To run Zed from your terminal, you must add ~/.local/bin to your PATH"
-        echo "Run:"
-
-        case "$SHELL" in
-            *zsh)
-                echo "   echo 'export PATH=\$HOME/.local/bin:\$PATH' >> ~/.zshrc"
-                echo "   source ~/.zshrc"
-                ;;
-            *fish)
-                echo "   fish_add_path -U $HOME/.local/bin"
-                ;;
-            *)
-                echo "   echo 'export PATH=\$HOME/.local/bin:\$PATH' >> ~/.bashrc"
-                echo "   source ~/.bashrc"
-                ;;
-        esac
-
-        echo "To run Zed now, '~/.local/bin/zed'"
-    fi
-}
-
-linux() {
-    if [ -n "${ZED_BUNDLE_PATH:-}" ]; then
-        cp "$ZED_BUNDLE_PATH" "$temp/zed-linux-$arch.tar.gz"
-    else
-        echo "Downloading Zed version: $ZED_VERSION"
-        curl "https://cloud.zed.dev/releases/$channel/$ZED_VERSION/download?asset=zed&arch=$arch&os=linux&source=install.sh" > "$temp/zed-linux-$arch.tar.gz"
-    fi
-
-    suffix=""
-    if [ "$channel" != "stable" ]; then
-        suffix="-$channel"
-    fi
-
-    appid=""
-    case "$channel" in
-      stable)
-        appid="dev.zed.Zed"
-        ;;
-      nightly)
-        appid="dev.zed.Zed-Nightly"
-        ;;
-      preview)
-        appid="dev.zed.Zed-Preview"
-        ;;
-      dev)
-        appid="dev.zed.Zed-Dev"
-        ;;
-      *)
-        echo "Unknown release channel: ${channel}. Using stable app ID."
-        appid="dev.zed.Zed"
-        ;;
-    esac
-
-    # Unpack
-    rm -rf "$HOME/.local/zed$suffix.app"
-    mkdir -p "$HOME/.local/zed$suffix.app"
-    tar -xzf "$temp/zed-linux-$arch.tar.gz" -C "$HOME/.local/"
-
-    zed_editor="$HOME/.local/zed$suffix.app/libexec/zed-editor"
-    if [ -f "$zed_editor" ] && command -v ldd >/dev/null 2>&1; then
-        missing="$(ldd "$zed_editor" 2>/dev/null | sed -n 's/^[[:space:]]*\(.*\) => not found$/\1/p')"
-        if [ -n "$missing" ]; then
-            echo "Warning: your system is missing libraries that Zed needs:"
-            echo "$missing" | sed 's/^/    /'
-            echo "Install them with your package manager, or Zed will fail to start."
         fi
     fi
+fi
 
-    # Setup ~/.local directories
-    mkdir -p "$HOME/.local/bin" "$HOME/.local/share/applications"
+tar -xzf "$archive" -C "$staging_directory"
+app_name="timber$suffix.app"
+staged_app="$staging_directory/$app_name"
+if [ ! -x "$staged_app/bin/timber" ] || [ ! -x "$staged_app/libexec/timber-editor" ] || [ ! -f "$staged_app/share/applications/$app_id.desktop" ]; then
+    echo "The archive is not a valid Timber $channel Linux bundle." >&2
+    exit 1
+fi
 
-    # Link the binary
-    if [ -f "$HOME/.local/zed$suffix.app/bin/zed" ]; then
-        ln -sf "$HOME/.local/zed$suffix.app/bin/zed" "$HOME/.local/bin/zed"
-    else
-        # support for versions before 0.139.x.
-        ln -sf "$HOME/.local/zed$suffix.app/bin/cli" "$HOME/.local/bin/zed"
+if ! library_status="$(ldd "$staged_app/libexec/timber-editor" 2>&1)"; then
+    echo "Timber cannot run on this system:" >&2
+    echo "$library_status" >&2
+    exit 1
+fi
+missing_libraries="$(printf '%s\n' "$library_status" | sed -n 's/^[[:space:]]*\(.*\) => not found$/\1/p')"
+if [ -n "$missing_libraries" ]; then
+    echo "Install the following required libraries before installing Timber:" >&2
+    echo "$missing_libraries" >&2
+    exit 1
+fi
+
+app_directory="$install_root/$app_name"
+launcher="$install_root/bin/timber$suffix"
+backup_suffix="backup-$(date +%Y%m%d%H%M%S)-$$"
+mkdir -p "$install_root/bin" "$install_root/share/applications"
+if [ -e "$app_directory" ]; then
+    mv "$app_directory" "$app_directory.$backup_suffix"
+    echo "Previous Timber installation saved to $app_directory.$backup_suffix"
+fi
+if [ -e "$launcher" ] || [ -L "$launcher" ]; then
+    if [ ! -L "$launcher" ] || [ "$(readlink "$launcher")" != "$app_directory/bin/timber" ]; then
+        mv "$launcher" "$launcher.$backup_suffix"
+        echo "Previous timber command saved to $launcher.$backup_suffix"
     fi
+fi
+mv "$staged_app" "$app_directory"
+ln -sfn "$app_directory/bin/timber" "$launcher"
 
-    # Copy .desktop file
-    desktop_file_path="$HOME/.local/share/applications/${appid}.desktop"
-    src_dir="$HOME/.local/zed$suffix.app/share/applications"
-    if [ -f "$src_dir/${appid}.desktop" ]; then
-        cp "$src_dir/${appid}.desktop" "${desktop_file_path}"
-    else
-        # Fallback for older tarballs
-        cp "$src_dir/zed$suffix.desktop" "${desktop_file_path}"
+escaped_app_directory="$(printf '%s' "$app_directory" | sed 's/[&|\\]/\\&/g')"
+sed -e "s|^Exec=timber |Exec=\"$escaped_app_directory/bin/timber\" |" \
+    -e "s|^TryExec=timber$|TryExec=$escaped_app_directory/bin/timber|" \
+    -e "s|^Icon=timber$|Icon=$escaped_app_directory/share/icons/hicolor/512x512/apps/timber.png|" \
+    "$app_directory/share/applications/$app_id.desktop" > "$install_root/share/applications/$app_id.desktop"
+chmod +x "$install_root/share/applications/$app_id.desktop"
+
+if command -v update-desktop-database >/dev/null 2>&1; then
+    if ! update-desktop-database "$install_root/share/applications"; then
+        echo "Timber is installed, but the desktop application cache could not be refreshed." >&2
     fi
-    sed -i "s|Icon=zed|Icon=$HOME/.local/zed$suffix.app/share/icons/hicolor/512x512/apps/zed.png|g" "${desktop_file_path}"
-    sed -i "s|Exec=zed|Exec=$HOME/.local/zed$suffix.app/bin/zed|g" "${desktop_file_path}"
-}
+fi
 
-macos() {
-    echo "Downloading Zed version: $ZED_VERSION"
-    curl "https://cloud.zed.dev/releases/$channel/$ZED_VERSION/download?asset=zed&os=macos&arch=$arch&source=install.sh" > "$temp/Zed-$arch.dmg"
-    hdiutil attach -quiet "$temp/Zed-$arch.dmg" -mountpoint "$temp/mount"
-    app="$(cd "$temp/mount/"; echo *.app)"
-    echo "Installing $app"
-    if [ -d "/Applications/$app" ]; then
-        echo "Removing existing $app"
-        rm -rf "/Applications/$app"
-    fi
-    ditto "$temp/mount/$app" "/Applications/$app"
-    hdiutil detach -quiet "$temp/mount"
-
-    mkdir -p "$HOME/.local/bin"
-    # Link the binary
-    ln -sf "/Applications/$app/Contents/MacOS/cli" "$HOME/.local/bin/zed"
-}
-
-main "$@"
+echo "Timber is installed. Open Timber from your application launcher or run $launcher"

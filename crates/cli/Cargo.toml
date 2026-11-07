@@ -19,7 +19,7 @@ required-features = ["cli"]
 
 [features]
 no-bundled-uninstall = ["cli"]
-default = ["cli"]
+default = ["cli", "no-bundled-uninstall"]
 cli = [
     "dep:askpass",
     "dep:clap",

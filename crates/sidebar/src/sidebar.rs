@@ -1,4 +1,7 @@
 mod thread_switcher;
+mod timber_sidebar;
+
+pub use timber_sidebar::TimberSidebar;
 
 use acp_thread::ThreadStatus;
 use action_log::DiffStats;
