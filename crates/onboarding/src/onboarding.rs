@@ -351,7 +351,7 @@ impl Render for Onboarding {
                                             .child(
                                                 v_flex()
                                                     .child(
-                                                        Headline::new("Welcome to Timber")
+                                                        Headline::new("Welcome to TAXE")
                                                             .size(HeadlineSize::Small),
                                                     )
                                                     .child(

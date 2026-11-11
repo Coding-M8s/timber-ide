@@ -336,7 +336,9 @@ fn compliance_check() -> (NamedJob, JobOutput) {
 }
 
 fn validate_release_assets(deps: &[&NamedJob]) -> NamedJob {
-    let expected_assets: Vec<String> = assets::all().iter().map(|a| format!("\"{a}\"")).collect();
+    let mut expected_assets = assets::all();
+    expected_assets.extend(["install.sh", "SHA256SUMS"]);
+    let expected_assets: Vec<String> = expected_assets.iter().map(|a| format!("\"{a}\"")).collect();
     let expected_assets_json = format!("[{}]", expected_assets.join(", "));
 
     let validation_script = formatdoc! {r#"
@@ -469,6 +471,12 @@ pub(crate) fn prep_release_artifacts() -> Step<Run> {
         script_lines.push(mv_command)
     }
 
+    script_lines.push("cp script/install.sh release-artifacts/install.sh".to_string());
+    script_lines.push(
+        "(cd release-artifacts && sha256sum taxe-linux-*.tar.gz install.sh > SHA256SUMS)"
+            .to_string(),
+    );
+
     named::bash(&script_lines.join("\n"))
 }
 
@@ -480,6 +488,7 @@ fn upload_release_assets(deps: &[&NamedJob], bundle: &ReleaseBundleJobs) -> Name
         dependant_job(&deps)
             .runs_on(runners::LINUX_MEDIUM)
             .permissions(Permissions::default().contents(Level::Write))
+            .add_step(steps::checkout_repo().with_ref(Context::github().ref_()))
             .add_step(download_workflow_artifacts())
             .add_step(steps::script("ls -lR ./artifacts"))
             .add_step(prep_release_artifacts())

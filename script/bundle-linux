@@ -12,7 +12,7 @@ Build a release .tar.gz for Linux.
 Options:
   -h, --help        Display this help and exit.
   --desktop-only    Build the Linux desktop app without the remote-development helper.
-  --flatpak         Unsupported until Timber Flatpak manifests are ported; use the native archive.
+  --flatpak         Unsupported until TAXE Flatpak manifests are ported; use the native archive.
   --require-sentry  Require Sentry credentials, CLI, and successful symbol upload (official releases).
   --skip-sentry     Skip symbol upload for local packaging; incompatible with --require-sentry.
   "
@@ -34,7 +34,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --flatpak)
-            echo "Timber Flatpak packaging is not configured. Use the native Linux archive instead." >&2
+            echo "TAXE Flatpak packaging is not configured. Use the native Linux archive instead." >&2
             exit 1
             ;;
         --require-sentry)
@@ -92,7 +92,7 @@ elif [[ -z "${SENTRY_AUTH_TOKEN:+set}" ]]; then
 fi
 
 export ZED_BUNDLE=true
-export ZED_UPDATE_EXPLANATION="${ZED_UPDATE_EXPLANATION:-Install a newer Timber release from Coding-M8s/timber-ide to update.}"
+export ZED_UPDATE_EXPLANATION="${ZED_UPDATE_EXPLANATION:-Install a newer TAXE release from Coding-M8s/timber-ide to update.}"
 
 channel=$(<crates/zed/RELEASE_CHANNEL)
 target_dir="${CARGO_TARGET_DIR:-target}"
@@ -133,7 +133,7 @@ if [[ ! "$lld_version" =~ LLD\ ([0-9]+)\. ]] || (( BASH_REMATCH[1] < 12 )); then
 fi
 
 # Build binary in release mode
-cargo --config .cargo/bundle-config.toml rustc --release --target "${target_triple}" --package zed --bin timber -- -C linker="$CC" -C llvm-args=-addrsig -C link-arg=-fuse-ld=lld -C link-arg=--ld-path="$lld" -C link-arg=-Wl,--icf=safe
+cargo --config .cargo/bundle-config.toml rustc --release --target "${target_triple}" --package zed --bin taxe -- -C linker="$CC" -C llvm-args=-addrsig -C link-arg=-fuse-ld=lld -C link-arg=--ld-path="$lld" -C link-arg=-Wl,--icf=safe
 cargo --config .cargo/bundle-config.toml build --release --target "${target_triple}" --package cli
 # Build remote_server in separate invocation to prevent feature unification from other crates
 # from influencing dynamic libraries required by it.
@@ -146,7 +146,7 @@ if ! "$desktop_only"; then
 fi
 
 if ! "$skip_sentry"; then
-    symbol_binaries=("${target_dir}/${target_triple}/release/timber")
+    symbol_binaries=("${target_dir}/${target_triple}/release/taxe")
     if ! "$desktop_only"; then
         symbol_binaries+=("${target_dir}/${remote_server_triple}/release/remote-server")
     fi
@@ -174,7 +174,7 @@ fi
 # is skipped.
 # We use llvm-objcopy because GNU objcopy on older distros (e.g. Ubuntu 20.04)
 # doesn't understand CREL sections produced by newer LLVM.
-llvm-objcopy --only-keep-debug "${target_dir}/${target_triple}/release/timber" "${target_dir}/${target_triple}/release/timber.dbg"
+llvm-objcopy --only-keep-debug "${target_dir}/${target_triple}/release/taxe" "${target_dir}/${target_triple}/release/taxe.dbg"
 if ! "$desktop_only"; then
     llvm-objcopy --only-keep-debug "${target_dir}/${remote_server_triple}/release/remote-server" "${target_dir}/${remote_server_triple}/release/remote-server.dbg"
 
@@ -197,13 +197,13 @@ fi
 # into a temp directory.
 temp_dir=$(mktemp -d)
 trap 'rm -rf "$temp_dir"' EXIT
-zed_dir="${temp_dir}/timber$suffix.app"
+zed_dir="${temp_dir}/taxe$suffix.app"
 
 # Cargo may reuse its outputs on the next invocation. Strip packaging copies
 # so reruns still upload full ELFs and extract complete debug companions.
 mkdir -p "${zed_dir}/bin" "${zed_dir}/libexec"
-llvm-objcopy --strip-unneeded "${target_dir}/${target_triple}/release/timber" "${zed_dir}/libexec/timber-editor"
-llvm-objcopy --strip-debug --discard-all "${target_dir}/${target_triple}/release/cli" "${zed_dir}/bin/timber"
+llvm-objcopy --strip-unneeded "${target_dir}/${target_triple}/release/taxe" "${zed_dir}/libexec/taxe-editor"
+llvm-objcopy --strip-debug --discard-all "${target_dir}/${target_triple}/release/cli" "${zed_dir}/bin/taxe"
 if ! "$desktop_only"; then
     llvm-objcopy --strip-debug --discard-all "${target_dir}/${remote_server_triple}/release/remote-server" "${temp_dir}/remote_server"
 fi
@@ -216,7 +216,7 @@ fi
 # get dlopen'd are built against the system GLib, and resolving them against an
 # older bundled copy fails with missing symbols.
 find_libs() {
-    ldd ${target_dir}/${target_triple}/release/timber |\
+    ldd ${target_dir}/${target_triple}/release/taxe |\
         cut -d' ' -f3 |\
         grep -v '\<\(libc.so\|libgcc_s.so\|libm.so\|libpthread.so\|libdl.so\|libasound.so\)' |\
         grep -v '\<\(libglib-2.0.so\|libgobject-2.0.so\|libgio-2.0.so\|libgmodule-2.0.so\|libpcre.so\|libpcre2-8.so\|libmount.so\|libblkid.so\|libselinux.so\|libffi.so\|libresolv.so\|libz.so\)'
@@ -228,27 +228,27 @@ cp $(find_libs) "${zed_dir}/lib"
 
 # Icons
 mkdir -p "${zed_dir}/share/icons/hicolor/512x512/apps"
-cp "crates/zed/resources/app-icon$suffix.png" "${zed_dir}/share/icons/hicolor/512x512/apps/timber.png"
+cp "crates/zed/resources/app-icon$suffix.png" "${zed_dir}/share/icons/hicolor/512x512/apps/taxe.png"
 mkdir -p "${zed_dir}/share/icons/hicolor/1024x1024/apps"
-cp "crates/zed/resources/app-icon$suffix@2x.png" "${zed_dir}/share/icons/hicolor/1024x1024/apps/timber.png"
+cp "crates/zed/resources/app-icon$suffix@2x.png" "${zed_dir}/share/icons/hicolor/1024x1024/apps/taxe.png"
 
 # .desktop
 export DO_STARTUP_NOTIFY="true"
-export APP_CLI="timber"
-export APP_ICON="timber"
+export APP_CLI="taxe"
+export APP_ICON="taxe"
 export APP_ARGS="%U"
 if [[ "$channel" == "preview" ]]; then
-  export APP_NAME="Timber Preview"
-  APP_ID="io.github.CodingM8s.Timber-Preview"
+  export APP_NAME="TAXE Preview"
+  APP_ID="io.github.CodingM8s.TAXE-Preview"
 elif [[ "$channel" == "nightly" ]]; then
-  export APP_NAME="Timber Nightly"
-  APP_ID="io.github.CodingM8s.Timber-Nightly"
+  export APP_NAME="TAXE Nightly"
+  APP_ID="io.github.CodingM8s.TAXE-Nightly"
 elif [[ "$channel" == "dev" ]]; then
-  export APP_NAME="Timber Devel"
-  APP_ID="io.github.CodingM8s.Timber-Dev"
+  export APP_NAME="TAXE Devel"
+  APP_ID="io.github.CodingM8s.TAXE-Dev"
 else
-  export APP_NAME="Timber"
-  APP_ID="io.github.CodingM8s.Timber"
+  export APP_NAME="TAXE"
+  APP_ID="io.github.CodingM8s.TAXE"
 fi
 
 export APP_ID
@@ -259,13 +259,17 @@ chmod +x "${zed_dir}/share/applications/$APP_ID.desktop"
 # Copy generated licenses so they'll end up in archive too
 cp "assets/licenses.md" "${zed_dir}/licenses.md"
 
+printf '%s\n' "$version" > "${zed_dir}/version"
+
 # Create archive out of everything that's in the temp directory
 arch=$(uname -m)
-archive="timber-linux-${arch}.tar.gz"
+archive="taxe-linux-${arch}.tar.gz"
 
 mkdir -p "${target_dir}/release"
-tar -czvf "${target_dir}/release/$archive" -C ${temp_dir} "timber$suffix.app"
+tar -czvf "${target_dir}/release/$archive" -C "${temp_dir}" "taxe$suffix.app"
+cp script/install.sh "${target_dir}/release/install.sh"
+(cd "${target_dir}/release" && sha256sum "$archive" install.sh > SHA256SUMS)
 
 if ! "$desktop_only"; then
-    gzip -f --stdout --best "${temp_dir}/remote_server" > "${target_dir}/timber-remote-server-linux-${arch}.gz"
+    gzip -f --stdout --best "${temp_dir}/remote_server" > "${target_dir}/taxe-remote-server-linux-${arch}.gz"
 fi

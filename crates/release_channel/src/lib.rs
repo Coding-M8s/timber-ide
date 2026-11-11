@@ -205,10 +205,10 @@ impl ReleaseChannel {
     /// Returns the display name for this [`ReleaseChannel`].
     pub fn display_name(&self) -> &'static str {
         match self {
-            ReleaseChannel::Dev => "Timber Dev",
-            ReleaseChannel::Nightly => "Timber Nightly",
-            ReleaseChannel::Preview => "Timber Preview",
-            ReleaseChannel::Stable => "Timber",
+            ReleaseChannel::Dev => "TAXE Dev",
+            ReleaseChannel::Nightly => "TAXE Nightly",
+            ReleaseChannel::Preview => "TAXE Preview",
+            ReleaseChannel::Stable => "TAXE",
         }
     }
 
@@ -227,10 +227,10 @@ impl ReleaseChannel {
     /// This also has to match the bundle identifier for Zed on macOS.
     pub fn app_id(&self) -> &'static str {
         match self {
-            ReleaseChannel::Dev => "io.github.CodingM8s.Timber-Dev",
-            ReleaseChannel::Nightly => "io.github.CodingM8s.Timber-Nightly",
-            ReleaseChannel::Preview => "io.github.CodingM8s.Timber-Preview",
-            ReleaseChannel::Stable => "io.github.CodingM8s.Timber",
+            ReleaseChannel::Dev => "io.github.CodingM8s.TAXE-Dev",
+            ReleaseChannel::Nightly => "io.github.CodingM8s.TAXE-Nightly",
+            ReleaseChannel::Preview => "io.github.CodingM8s.TAXE-Preview",
+            ReleaseChannel::Stable => "io.github.CodingM8s.TAXE",
         }
     }
 

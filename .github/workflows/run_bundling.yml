@@ -47,14 +47,14 @@ jobs:
     - name: run_bundling::upload_artifact
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
-        name: timber-linux-aarch64.tar.gz
-        path: target/release/timber-linux-aarch64.tar.gz
+        name: taxe-linux-aarch64.tar.gz
+        path: target/release/taxe-linux-aarch64.tar.gz
         if-no-files-found: error
     - name: run_bundling::upload_artifact
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
-        name: timber-remote-server-linux-aarch64.gz
-        path: target/timber-remote-server-linux-aarch64.gz
+        name: taxe-remote-server-linux-aarch64.gz
+        path: target/taxe-remote-server-linux-aarch64.gz
         if-no-files-found: error
     timeout-minutes: 60
   bundle_linux_x86_64:
@@ -92,14 +92,14 @@ jobs:
     - name: run_bundling::upload_artifact
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
-        name: timber-linux-x86_64.tar.gz
-        path: target/release/timber-linux-x86_64.tar.gz
+        name: taxe-linux-x86_64.tar.gz
+        path: target/release/taxe-linux-x86_64.tar.gz
         if-no-files-found: error
     - name: run_bundling::upload_artifact
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
-        name: timber-remote-server-linux-x86_64.gz
-        path: target/timber-remote-server-linux-x86_64.gz
+        name: taxe-remote-server-linux-x86_64.gz
+        path: target/taxe-remote-server-linux-x86_64.gz
         if-no-files-found: error
     timeout-minutes: 60
   build_static_bwrap_linux_aarch64:

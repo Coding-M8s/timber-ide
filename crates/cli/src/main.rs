@@ -48,21 +48,21 @@ trait InstalledApp {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "timber",
+    name = "taxe",
     disable_version_flag = true,
-    before_help = "The Timber CLI binary.
-This CLI is a separate binary that invokes Timber.
+    before_help = "The TAXE CLI binary.
+This CLI is a separate binary that invokes TAXE.
 
 Examples:
-    `timber`
-          Simply opens Timber
-    `timber --foreground`
+    `taxe`
+          Simply opens TAXE
+    `taxe --foreground`
           Runs in foreground (shows all logs)
-    `timber path-to-your-project`
-          Open your project in Timber
-    `timber -n path-to-file `
+    `taxe path-to-your-project`
+          Open your project in TAXE
+    `taxe -n path-to-file `
           Open file/folder in a new window",
-    after_help = "To read from stdin, append '-', e.g. 'ps axf | timber -'"
+    after_help = "To read from stdin, append '-', e.g. 'ps axf | taxe -'"
 )]
 struct Args {
     /// Wait for all of the given paths to be opened/closed before exiting.
@@ -79,7 +79,7 @@ struct Args {
     /// Reuse an existing window, replacing its workspace
     #[arg(short, long, overrides_with_all = ["add", "new", "existing", "classic"], hide = true)]
     reuse: bool,
-    /// Open in existing Timber window
+    /// Open in existing TAXE window
     #[arg(short = 'e', long = "existing", overrides_with_all = ["add", "new", "reuse", "classic"])]
     existing: bool,
     /// Use the classic open behavior: new window for directories, reuse for files
@@ -91,23 +91,23 @@ struct Args {
     #[cfg_attr(target_os = "windows", doc = "`%LOCALAPPDATA%\\Zed`.")]
     #[cfg_attr(
         not(any(target_os = "windows", target_os = "macos")),
-        doc = "`$XDG_DATA_HOME/timber`."
+        doc = "`$XDG_DATA_HOME/taxe`."
     )]
     #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
     user_data_dir: Option<String>,
-    /// The paths to open in Timber (space-separated).
+    /// The paths to open in TAXE (space-separated).
     ///
     /// Use `path:line:column` syntax to open a file at the given line and column.
     #[arg(trailing_var_arg = true, value_hint = clap::ValueHint::AnyPath)]
     paths_with_position: Vec<String>,
-    /// Print Timber's version and the app path.
+    /// Print TAXE's version and the app path.
     #[arg(short, long)]
     version: bool,
-    /// Run Timber in the foreground (useful for debugging)
+    /// Run TAXE in the foreground (useful for debugging)
     #[arg(long)]
     foreground: bool,
-    /// Custom path to the Timber editor binary
-    #[arg(long = "timber", alias = "zed")]
+    /// Custom path to the TAXE editor binary
+    #[arg(long = "taxe", aliases = ["zed", "timber"])]
     zed: Option<PathBuf>,
     /// Run zed in dev-server mode
     #[arg(long)]
@@ -138,7 +138,7 @@ struct Args {
     /// When directories are provided, recurses into them and shows all changed files in a single multi-diff view.
     #[arg(long, action = clap::ArgAction::Append, num_args = 2, value_names = ["OLD_PATH", "NEW_PATH"], value_hint = clap::ValueHint::AnyPath)]
     diff: Vec<String>,
-    /// Generate shell completions for Zed
+    /// Generate shell completions for TAXE
     #[arg(long, value_names = ["SHELL"])]
     completions: Option<Shell>,
     /// Uninstall Zed from user system
@@ -794,7 +794,7 @@ fn anonymous_fd(path: &str) -> Option<fs::File> {
 }
 
 /// Shows an interactive prompt asking the user to choose the default open
-/// behavior for `zed <path>`. Returns `None` if the prompt cannot be shown
+/// behavior for `taxe <path>`. Returns `None` if the prompt cannot be shown
 /// (e.g. stdin is not a terminal) or the user cancels.
 fn prompt_open_behavior() -> Option<cli::CliBehaviorSetting> {
     if !std::io::stdin().is_terminal() {
@@ -804,16 +804,16 @@ fn prompt_open_behavior() -> Option<cli::CliBehaviorSetting> {
     let blue = console::Style::new().blue();
     let items = [
         format!(
-            "Add to existing Zed window ({})",
-            blue.apply_to("zed --existing")
+            "Add to existing TAXE window ({})",
+            blue.apply_to("taxe --existing")
         ),
-        format!("Open a new window ({})", blue.apply_to("zed --classic")),
+        format!("Open a new window ({})", blue.apply_to("taxe --classic")),
     ];
 
     let prompt = format!(
         "Configure default behavior for {}\n{}",
-        blue.apply_to("zed <path>"),
-        console::style("You can change this later in Zed settings"),
+        blue.apply_to("taxe <path>"),
+        console::style("You can change this later in TAXE settings"),
     );
 
     let selection = dialoguer::Select::new()
@@ -860,9 +860,9 @@ mod linux {
                 let dir = cli.parent().context("no parent path for cli")?;
 
                 let possible_locations = [
-                    "../libexec/timber-editor",
-                    "../lib/timber/timber-editor",
-                    "./timber",
+                    "../libexec/taxe-editor",
+                    "../lib/taxe/taxe-editor",
+                    "./taxe",
                 ];
                 possible_locations
                     .iter()
@@ -879,7 +879,7 @@ mod linux {
     impl InstalledApp for App {
         fn zed_version_string(&self) -> String {
             format!(
-                "Timber {}{}{} – {}",
+                "TAXE {}{}{} – {}",
                 if *release_channel::RELEASE_CHANNEL_NAME == "stable" {
                     "".to_string()
                 } else {
@@ -996,7 +996,7 @@ mod flatpak {
 
         if !invocation_args
             .iter()
-            .any(|arg| arg == "--zed" || arg == "--timber")
+            .any(|arg| arg == "--zed" || arg == "--taxe" || arg == "--timber")
         {
             // Positional paths consume all following arguments, so launcher options must precede them.
             args.push("--zed".into());
@@ -1160,7 +1160,7 @@ mod windows {
     impl InstalledApp for App {
         fn zed_version_string(&self) -> String {
             format!(
-                "Timber {}{}{} – {}",
+                "TAXE {}{}{} – {}",
                 if *release_channel::RELEASE_CHANNEL_NAME == "stable" {
                     "".to_string()
                 } else {
@@ -1333,7 +1333,7 @@ mod mac_os {
 
     impl InstalledApp for Bundle {
         fn zed_version_string(&self) -> String {
-            format!("Timber {} – {}", self.version(), self.path().display(),)
+            format!("TAXE {} – {}", self.version(), self.path().display(),)
         }
 
         fn launch(&self, url: String, user_data_dir: Option<&str>) -> anyhow::Result<()> {
