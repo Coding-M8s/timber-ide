@@ -135,14 +135,14 @@ jobs:
     - name: run_bundling::upload_artifact
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
-        name: timber-linux-aarch64.tar.gz
-        path: target/release/timber-linux-aarch64.tar.gz
+        name: taxe-linux-aarch64.tar.gz
+        path: target/release/taxe-linux-aarch64.tar.gz
         if-no-files-found: error
     - name: run_bundling::upload_artifact
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
-        name: timber-remote-server-linux-aarch64.gz
-        path: target/timber-remote-server-linux-aarch64.gz
+        name: taxe-remote-server-linux-aarch64.gz
+        path: target/taxe-remote-server-linux-aarch64.gz
         if-no-files-found: error
     timeout-minutes: 60
   bundle_linux_x86_64:
@@ -185,14 +185,14 @@ jobs:
     - name: run_bundling::upload_artifact
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
-        name: timber-linux-x86_64.tar.gz
-        path: target/release/timber-linux-x86_64.tar.gz
+        name: taxe-linux-x86_64.tar.gz
+        path: target/release/taxe-linux-x86_64.tar.gz
         if-no-files-found: error
     - name: run_bundling::upload_artifact
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
-        name: timber-remote-server-linux-x86_64.gz
-        path: target/timber-remote-server-linux-x86_64.gz
+        name: taxe-remote-server-linux-x86_64.gz
+        path: target/taxe-remote-server-linux-x86_64.gz
         if-no-files-found: error
     timeout-minutes: 60
   build_static_bwrap_linux_aarch64:
@@ -623,18 +623,20 @@ jobs:
 
         mv ./artifacts/Zed-aarch64.dmg/Zed-aarch64.dmg release-artifacts/Zed-aarch64.dmg
         mv ./artifacts/Zed-x86_64.dmg/Zed-x86_64.dmg release-artifacts/Zed-x86_64.dmg
-        mv ./artifacts/timber-linux-aarch64.tar.gz/timber-linux-aarch64.tar.gz release-artifacts/timber-linux-aarch64.tar.gz
-        mv ./artifacts/timber-linux-x86_64.tar.gz/timber-linux-x86_64.tar.gz release-artifacts/timber-linux-x86_64.tar.gz
+        mv ./artifacts/taxe-linux-aarch64.tar.gz/taxe-linux-aarch64.tar.gz release-artifacts/taxe-linux-aarch64.tar.gz
+        mv ./artifacts/taxe-linux-x86_64.tar.gz/taxe-linux-x86_64.tar.gz release-artifacts/taxe-linux-x86_64.tar.gz
         mv ./artifacts/bwrap-linux-aarch64.gz/bwrap-linux-aarch64.gz release-artifacts/bwrap-linux-aarch64.gz
         mv ./artifacts/bwrap-linux-x86_64.gz/bwrap-linux-x86_64.gz release-artifacts/bwrap-linux-x86_64.gz
         mv ./artifacts/Zed-x86_64.exe/Zed-x86_64.exe release-artifacts/Zed-x86_64.exe
         mv ./artifacts/Zed-aarch64.exe/Zed-aarch64.exe release-artifacts/Zed-aarch64.exe
         mv ./artifacts/zed-remote-server-macos-aarch64.gz/zed-remote-server-macos-aarch64.gz release-artifacts/zed-remote-server-macos-aarch64.gz
         mv ./artifacts/zed-remote-server-macos-x86_64.gz/zed-remote-server-macos-x86_64.gz release-artifacts/zed-remote-server-macos-x86_64.gz
-        mv ./artifacts/timber-remote-server-linux-aarch64.gz/timber-remote-server-linux-aarch64.gz release-artifacts/timber-remote-server-linux-aarch64.gz
-        mv ./artifacts/timber-remote-server-linux-x86_64.gz/timber-remote-server-linux-x86_64.gz release-artifacts/timber-remote-server-linux-x86_64.gz
+        mv ./artifacts/taxe-remote-server-linux-aarch64.gz/taxe-remote-server-linux-aarch64.gz release-artifacts/taxe-remote-server-linux-aarch64.gz
+        mv ./artifacts/taxe-remote-server-linux-x86_64.gz/taxe-remote-server-linux-x86_64.gz release-artifacts/taxe-remote-server-linux-x86_64.gz
         mv ./artifacts/zed-remote-server-windows-aarch64.zip/zed-remote-server-windows-aarch64.zip release-artifacts/zed-remote-server-windows-aarch64.zip
         mv ./artifacts/zed-remote-server-windows-x86_64.zip/zed-remote-server-windows-x86_64.zip release-artifacts/zed-remote-server-windows-x86_64.zip
+        cp script/install.sh release-artifacts/install.sh
+        (cd release-artifacts && sha256sum taxe-linux-*.tar.gz install.sh > SHA256SUMS)
     - name: ./script/upload-nightly
       run: ./script/upload-nightly
       env:

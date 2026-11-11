@@ -922,9 +922,8 @@ impl TimberSidebar {
                             self.sync_handoff_projects(cx);
                         }
                         Err(error) => {
-                            self.error = Some(
-                                format!("Cannot locate Timber IDE executable: {error:#}").into(),
-                            );
+                            self.error =
+                                Some(format!("Cannot locate TAXE executable: {error:#}").into());
                         }
                     }
                     self._subscriptions

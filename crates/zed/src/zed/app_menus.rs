@@ -68,10 +68,10 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
 
     vec![
         Menu {
-            name: "Timber".into(),
+            name: "TAXE".into(),
             disabled: false,
             items: vec![
-                MenuItem::action("About Timber", zed_actions::About),
+                MenuItem::action("About TAXE", zed_actions::About),
                 MenuItem::action("Check for Updates", auto_update::Check),
                 MenuItem::separator(),
                 MenuItem::submenu(Menu::new("Settings").items([

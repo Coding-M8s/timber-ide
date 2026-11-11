@@ -5,18 +5,18 @@ set -euxo pipefail
 if [[ $# -gt 0 ]]; then
   echo "
   Usage: ${0##*/}
-  Builds and installs timber onto your system into ~/.local, making it available as ~/.local/bin/timber.
+  Builds and installs taxe onto your system into ~/.local, making it available as ~/.local/bin/taxe.
 
   Before running this you should ensure you have all the build dependencies installed with `./script/linux`.
   "
   exit 1
 fi
-export TIMBER_CHANNEL=$(<crates/zed/RELEASE_CHANNEL)
-export ZED_UPDATE_EXPLANATION="Install a newer Timber release from Coding-M8s/timber-ide to update."
+export TAXE_CHANNEL=$(<crates/zed/RELEASE_CHANNEL)
+export ZED_UPDATE_EXPLANATION="Install a newer TAXE release from Coding-M8s/timber-ide to update."
 script/bundle-linux --desktop-only --skip-sentry
 
 arch="$(uname -m)"
 commit=$(git rev-parse HEAD | cut -c 1-7)
-archive="timber-linux-${arch}.tar.gz"
-export TIMBER_BUNDLE_PATH="${CARGO_TARGET_DIR:-target}/release/${archive}"
+archive="taxe-linux-${arch}.tar.gz"
+export TAXE_BUNDLE_PATH="${CARGO_TARGET_DIR:-target}/release/${archive}"
 script/install.sh

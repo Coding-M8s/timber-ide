@@ -451,9 +451,9 @@ impl Render for WelcomePage {
         };
 
         let welcome_label = if self.fallback_to_recent_projects {
-            "Welcome back to Timber"
+            "Welcome back to TAXE"
         } else {
-            "Welcome to Timber"
+            "Welcome to TAXE"
         };
 
         h_flex()

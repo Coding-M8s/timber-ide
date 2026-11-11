@@ -12,7 +12,7 @@ use workspace::{Toast, Workspace};
 actions!(
     cli,
     [
-        /// Installs the Timber CLI tool to the system PATH.
+        /// Installs the TAXE CLI tool to the system PATH.
         InstallCliBinary,
     ]
 );
@@ -80,7 +80,7 @@ async fn install_script(cx: &AsyncApp) -> Result<Option<PathBuf>> {
 }
 
 pub fn install_cli_binary(window: &mut Window, cx: &mut Context<Workspace>) {
-    const LINUX_PROMPT_DETAIL: &str = "The Timber installer adds ~/.local/bin/timber. Add ~/.local/bin to your PATH, or launch Timber directly with ~/.local/bin/timber.";
+    const LINUX_PROMPT_DETAIL: &str = "The TAXE installer adds ~/.local/bin/taxe. Add ~/.local/bin to your PATH, or launch TAXE directly with ~/.local/bin/taxe.";
 
     cx.spawn_in(window, async move |workspace, cx| {
         if cfg!(any(target_os = "linux", target_os = "freebsd")) {

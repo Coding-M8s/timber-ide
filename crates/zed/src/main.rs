@@ -94,7 +94,7 @@ fn build_application() -> Application {
 }
 
 fn files_not_created_on_launch(errors: HashMap<io::ErrorKind, Vec<&Path>>) {
-    let message = "Timber failed to launch";
+    let message = "TAXE failed to launch";
     let error_details = errors
         .into_iter()
         .flat_map(|(kind, paths)| {
@@ -156,7 +156,7 @@ fn fail_to_open_window_async(e: anyhow::Error, cx: &mut AsyncApp) {
 
 fn fail_to_open_window(e: anyhow::Error, _cx: &mut App) {
     eprintln!(
-        "Timber failed to open a window: {e:?}. See https://zed.dev/docs/linux for troubleshooting steps."
+        "TAXE failed to open a window: {e:?}. See https://zed.dev/docs/linux for troubleshooting steps."
     );
     #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     {
@@ -176,7 +176,7 @@ fn fail_to_open_window(e: anyhow::Error, _cx: &mut App) {
             proxy
                 .add_notification(
                     notification_id,
-                    Notification::new("Timber failed to launch")
+                    Notification::new("TAXE failed to launch")
                         .body(Some(
                             format!(
                                 "{e:?}. See https://zed.dev/docs/linux for troubleshooting steps."
@@ -323,7 +323,7 @@ fn main() {
             client::telemetry::os_name(),
             client::telemetry::os_version(),
         );
-        println!("Timber System Specs (from CLI):\n{}", system_specs);
+        println!("TAXE System Specs (from CLI):\n{}", system_specs);
         return;
     }
 
@@ -335,7 +335,7 @@ fn main() {
         .unwrap();
 
     log::info!(
-        "========== starting Timber version {}, sha {} ==========",
+        "========== starting TAXE version {}, sha {} ==========",
         app_version,
         app_commit_sha
             .as_ref()
@@ -1703,7 +1703,7 @@ fn stdout_is_a_pty() -> bool {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "timber", disable_version_flag = true, max_term_width = 100)]
+#[command(name = "taxe", disable_version_flag = true, max_term_width = 100)]
 struct Args {
     /// A sequence of space-separated paths or urls that you want to open.
     ///
@@ -1722,7 +1722,7 @@ struct Args {
     ///
     /// This overrides the default platform-specific data directory location.
     /// On macOS, the default is `~/Library/Application Support/Zed`.
-    /// On Linux/FreeBSD, the default is `$XDG_DATA_HOME/timber`.
+    /// On Linux/FreeBSD, the default is `$XDG_DATA_HOME/taxe`.
     /// On Windows, the default is `%LOCALAPPDATA%\Zed`.
     #[arg(long, value_name = "DIR", verbatim_doc_comment)]
     user_data_dir: Option<String>,

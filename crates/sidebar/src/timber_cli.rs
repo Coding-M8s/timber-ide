@@ -12,11 +12,10 @@ pub(crate) fn command() -> PathBuf {
 }
 
 fn command_from_environment(command: Option<OsString>) -> PathBuf {
-    // The editor also installs a `timber` executable; do not invoke it as the worktree backend.
     command
         .filter(|command| !command.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("timber-worktree"))
+        .unwrap_or_else(|| PathBuf::from("timber"))
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1253,14 +1252,11 @@ mod command_tests {
     use super::*;
 
     #[test]
-    fn defaults_to_a_distinct_worktree_backend() {
-        assert_eq!(
-            command_from_environment(None),
-            PathBuf::from("timber-worktree")
-        );
+    fn defaults_to_the_timber_worktree_cli() {
+        assert_eq!(command_from_environment(None), PathBuf::from("timber"));
         assert_eq!(
             command_from_environment(Some(OsString::new())),
-            PathBuf::from("timber-worktree")
+            PathBuf::from("timber")
         );
     }
 
